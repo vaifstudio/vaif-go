@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net/url"
 	"sync"
 	"time"
 
@@ -52,21 +53,34 @@ func (r *Realtime) Connect(opts *RealtimeOptions) error {
 	r.notifyConnectionState(ConnectionConnecting)
 
 	config := r.client.GetConfig()
-	url := fmt.Sprintf("%s?apikey=%s&project=%s", config.RealtimeURL, config.APIKey, config.ProjectID)
-	if token := r.client.GetAccessToken(); token != "" {
-		url += "&token=" + token
-	}
-
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	// Build WebSocket URL with proper URL encoding to prevent injection
+	wsURL, err := url.Parse(config.RealtimeURL)
 	if err != nil {
-		r.client.debug("Realtime connection failed: %v", err)
+		return fmt.Errorf("invalid realtime URL: %w", err)
+	}
+	q := wsURL.Query()
+	q.Set("apikey", config.APIKey)
+	q.Set("project", config.ProjectID)
+	if token := r.client.GetAccessToken(); token != "" {
+		q.Set("token", token)
+	}
+	wsURL.RawQuery = q.Encode()
+
+	// Log connection attempt without credentials
+	r.client.debug("Realtime connecting to %s", config.RealtimeURL)
+
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+	}
+	conn, _, err := dialer.Dial(wsURL.String(), nil)
+	if err != nil {
+		r.client.debug("Realtime connection failed")
 		r.mu.Lock()
 		r.connState = ConnectionDisconnected
 		r.mu.Unlock()
 		r.notifyConnectionState(ConnectionDisconnected)
-		r.notifyError(fmt.Errorf("websocket dial: %w", err))
-		go r.handleDisconnect()
-		return fmt.Errorf("websocket dial: %w", err)
+		r.notifyError(fmt.Errorf("websocket dial failed"))
+		return fmt.Errorf("websocket dial failed: %w", err)
 	}
 
 	r.mu.Lock()
@@ -306,8 +320,16 @@ func (r *Realtime) handleDisconnect() {
 	r.mu.Lock()
 	wasConnected := r.connState == ConnectionConnected || r.connState == ConnectionReconnecting
 	r.connState = ConnectionDisconnected
+
+	// Close the old connection if still set (prevent leak)
+	conn := r.conn
+	r.conn = nil
 	opts := r.options
 	r.mu.Unlock()
+
+	if conn != nil {
+		conn.Close()
+	}
 
 	if wasConnected {
 		r.notifyConnectionState(ConnectionDisconnected)
@@ -342,14 +364,18 @@ func (r *Realtime) handleDisconnect() {
 	if delay > 30*time.Second {
 		delay = 30 * time.Second
 	}
-	// Add jitter: 0-25% of delay
-	jitter := time.Duration(rand.Int63n(int64(delay) / 4))
-	delay += jitter
+	// Add jitter: 0-25% of delay (guard against zero delay)
+	if delay > 0 {
+		jitter := time.Duration(rand.Int63n(int64(delay) / 4))
+		delay += jitter
+	}
 
 	r.client.debug("Reconnecting in %v (attempt %d/%d)", delay, attempt, opts.MaxReconnectAttempts)
 	time.Sleep(delay)
 
-	r.Connect(nil)
+	if err := r.Connect(nil); err != nil {
+		r.client.debug("Reconnect attempt %d failed: %v", attempt, err)
+	}
 }
 
 func (r *Realtime) notifyConnectionState(state ConnectionState) {

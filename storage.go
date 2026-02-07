@@ -9,9 +9,11 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 // Storage provides file storage operations including upload, download, and
@@ -78,7 +80,7 @@ type CreateBucketOptions struct {
 
 // DeleteBucket deletes a storage bucket.
 func (s *Storage) DeleteBucket(ctx context.Context, name string) error {
-	raw, err := s.client.request(ctx, "DELETE", "/storage/buckets/"+name, nil, nil)
+	raw, err := s.client.request(ctx, "DELETE", "/storage/buckets/"+url.PathEscape(name), nil, nil)
 	if err != nil {
 		return err
 	}
@@ -141,8 +143,8 @@ func (sb *StorageBucket) Upload(ctx context.Context, path string, data io.Reader
 
 	writer.Close()
 
-	url := fmt.Sprintf("%s/storage/%s/%s", config.APIURL, sb.bucket, path)
-	req, err := http.NewRequestWithContext(ctx, "POST", url, &body)
+	uploadURL := fmt.Sprintf("%s/storage/%s/%s", config.APIURL, url.PathEscape(sb.bucket), encodePathSegments(path))
+	req, err := http.NewRequestWithContext(ctx, "POST", uploadURL, &body)
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +163,8 @@ func (sb *StorageBucket) Upload(ctx context.Context, path string, data io.Reader
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	// Limit response body read (upload responses should be small)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return nil, fmt.Errorf("read upload response: %w", err)
 	}
@@ -217,9 +220,9 @@ func (sb *StorageBucket) UploadFile(ctx context.Context, remotePath, localPath s
 // image transformations (resize, format conversion, etc.).
 func (sb *StorageBucket) Download(ctx context.Context, path string, transform *ImageTransformOptions) ([]byte, error) {
 	config := sb.client.GetConfig()
-	url := fmt.Sprintf("%s/storage/%s/%s", config.APIURL, sb.bucket, path)
+	downloadURL := fmt.Sprintf("%s/storage/%s/%s", config.APIURL, url.PathEscape(sb.bucket), encodePathSegments(path))
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -256,7 +259,8 @@ func (sb *StorageBucket) Download(ctx context.Context, path string, transform *I
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return io.ReadAll(resp.Body)
+		// Limit download size to prevent OOM from malicious servers (256 MB)
+		return io.ReadAll(io.LimitReader(resp.Body, 256<<20))
 	}
 
 	return nil, &StorageError{
@@ -289,7 +293,7 @@ func (sb *StorageBucket) DownloadToFile(ctx context.Context, remotePath, localPa
 // GetPublicURL returns the public URL for a file. The file must be in a public bucket.
 func (sb *StorageBucket) GetPublicURL(path string) string {
 	config := sb.client.GetConfig()
-	return fmt.Sprintf("%s/storage/%s/%s", config.APIURL, sb.bucket, path)
+	return fmt.Sprintf("%s/storage/%s/%s", config.APIURL, url.PathEscape(sb.bucket), encodePathSegments(path))
 }
 
 // CreateSignedURL creates a signed URL for temporary file access.
@@ -303,7 +307,7 @@ func (sb *StorageBucket) CreateSignedURL(ctx context.Context, path string, opts 
 		body["download"] = opts.Download
 	}
 
-	raw, err := sb.client.request(ctx, "POST", fmt.Sprintf("/storage/%s/%s/sign", sb.bucket, path), body, nil)
+	raw, err := sb.client.request(ctx, "POST", fmt.Sprintf("/storage/%s/%s/sign", url.PathEscape(sb.bucket), encodePathSegments(path)), body, nil)
 	if err != nil {
 		return "", err
 	}
@@ -335,7 +339,7 @@ func (sb *StorageBucket) List(ctx context.Context, path string, opts *ListFilesO
 		}
 	}
 
-	raw, err := sb.client.request(ctx, "POST", fmt.Sprintf("/storage/%s/list", sb.bucket), body, nil)
+	raw, err := sb.client.request(ctx, "POST", fmt.Sprintf("/storage/%s/list", url.PathEscape(sb.bucket)), body, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -352,7 +356,7 @@ func (sb *StorageBucket) List(ctx context.Context, path string, opts *ListFilesO
 func (sb *StorageBucket) Move(ctx context.Context, fromPath, toPath string) error {
 	body := map[string]any{"from": fromPath, "to": toPath}
 
-	raw, err := sb.client.request(ctx, "POST", fmt.Sprintf("/storage/%s/move", sb.bucket), body, nil)
+	raw, err := sb.client.request(ctx, "POST", fmt.Sprintf("/storage/%s/move", url.PathEscape(sb.bucket)), body, nil)
 	if err != nil {
 		return err
 	}
@@ -369,7 +373,7 @@ func (sb *StorageBucket) Move(ctx context.Context, fromPath, toPath string) erro
 func (sb *StorageBucket) Copy(ctx context.Context, fromPath, toPath string) error {
 	body := map[string]any{"from": fromPath, "to": toPath}
 
-	raw, err := sb.client.request(ctx, "POST", fmt.Sprintf("/storage/%s/copy", sb.bucket), body, nil)
+	raw, err := sb.client.request(ctx, "POST", fmt.Sprintf("/storage/%s/copy", url.PathEscape(sb.bucket)), body, nil)
 	if err != nil {
 		return err
 	}
@@ -386,7 +390,7 @@ func (sb *StorageBucket) Copy(ctx context.Context, fromPath, toPath string) erro
 func (sb *StorageBucket) Remove(ctx context.Context, paths []string) error {
 	body := map[string]any{"paths": paths}
 
-	raw, err := sb.client.request(ctx, "DELETE", fmt.Sprintf("/storage/%s/delete", sb.bucket), body, nil)
+	raw, err := sb.client.request(ctx, "DELETE", fmt.Sprintf("/storage/%s/delete", url.PathEscape(sb.bucket)), body, nil)
 	if err != nil {
 		return err
 	}
@@ -397,6 +401,15 @@ func (sb *StorageBucket) Remove(ctx context.Context, paths []string) error {
 	}
 
 	return nil
+}
+
+// encodePathSegments URL-encodes each segment of a path while preserving slashes.
+func encodePathSegments(path string) string {
+	parts := strings.Split(path, "/")
+	for i, p := range parts {
+		parts[i] = url.PathEscape(p)
+	}
+	return strings.Join(parts, "/")
 }
 
 // detectContentType returns the MIME type based on file extension.

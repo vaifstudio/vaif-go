@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"strings"
 	"time"
 )
@@ -35,7 +36,7 @@ func (f *Functions) Invoke(ctx context.Context, name string, body any, opts *Fun
 	}
 
 	config := f.client.GetConfig()
-	url := fmt.Sprintf("%s/functions/%s", config.APIURL, name)
+	url := fmt.Sprintf("%s/functions/%s", config.APIURL, neturl.PathEscape(name))
 
 	var bodyReader io.Reader
 	if body != nil {
@@ -83,7 +84,8 @@ func (f *Functions) Invoke(ctx context.Context, name string, body any, opts *Fun
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	// Limit function response body to 64 MB to prevent OOM
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {
 		return &FunctionResponse[any]{
 			Error: &FunctionError{Message: "failed to read response", Name: name},
@@ -119,7 +121,7 @@ func (f *Functions) Invoke(ctx context.Context, name string, body any, opts *Fun
 
 // CreateURL returns the URL for direct function invocation (e.g. for webhooks).
 func (f *Functions) CreateURL(name string) string {
-	return fmt.Sprintf("%s/functions/%s", f.client.config.APIURL, name)
+	return fmt.Sprintf("%s/functions/%s", f.client.config.APIURL, neturl.PathEscape(name))
 }
 
 // List returns all deployed functions.
@@ -144,7 +146,7 @@ func (f *Functions) List(ctx context.Context) ([]map[string]any, error) {
 
 // Get returns details for a specific deployed function.
 func (f *Functions) Get(ctx context.Context, name string) (map[string]any, error) {
-	raw, err := f.client.request(ctx, "GET", "/functions/"+name, nil, nil)
+	raw, err := f.client.request(ctx, "GET", "/functions/"+neturl.PathEscape(name), nil, nil)
 	if err != nil {
 		return nil, err
 	}

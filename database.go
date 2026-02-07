@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 )
 
 // Database provides type-safe database operations with a fluent query builder.
@@ -69,7 +70,7 @@ func (d *Database) RPC(ctx context.Context, functionName string, params map[stri
 		params = map[string]any{}
 	}
 
-	raw, err := d.client.request(ctx, "POST", "/db/rpc/"+functionName, params, nil)
+	raw, err := d.client.request(ctx, "POST", "/db/rpc/"+url.PathEscape(functionName), params, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -392,7 +393,7 @@ func (q *QueryBuilder) Count(countType string) *QueryBuilder {
 func (q *QueryBuilder) Execute(ctx context.Context) (*QueryResult[[]map[string]any], error) {
 	body := q.buildQuery()
 
-	raw, err := q.client.request(ctx, q.httpMethod(), "/db/"+q.table, body, nil)
+	raw, err := q.client.request(ctx, q.httpMethod(), "/db/"+url.PathEscape(q.table), body, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -434,7 +435,7 @@ func (q *QueryBuilder) Execute(ctx context.Context) (*QueryResult[[]map[string]a
 func (q *QueryBuilder) ExecuteInto(ctx context.Context, dest any) error {
 	body := q.buildQuery()
 
-	raw, err := q.client.request(ctx, q.httpMethod(), "/db/"+q.table, body, nil)
+	raw, err := q.client.request(ctx, q.httpMethod(), "/db/"+url.PathEscape(q.table), body, nil)
 	if err != nil {
 		return err
 	}
@@ -508,7 +509,7 @@ func (q *QueryBuilder) MaybeSingle(ctx context.Context) (*QueryResult[map[string
 func (q *QueryBuilder) ExecuteJSON(ctx context.Context) (json.RawMessage, error) {
 	body := q.buildQuery()
 
-	raw, err := q.client.request(ctx, q.httpMethod(), "/db/"+q.table, body, nil)
+	raw, err := q.client.request(ctx, q.httpMethod(), "/db/"+url.PathEscape(q.table), body, nil)
 	if err != nil {
 		return nil, err
 	}

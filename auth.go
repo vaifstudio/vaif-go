@@ -12,13 +12,20 @@ import (
 // AuthStateChangeCallback is called when auth state changes.
 type AuthStateChangeCallback func(event AuthChangeEvent, session *Session)
 
+// authCallback wraps a callback with a unique ID for safe unsubscription.
+type authCallback struct {
+	id uint64
+	fn AuthStateChangeCallback
+}
+
 // Auth provides authentication and user management. All methods are safe
 // for concurrent use.
 type Auth struct {
 	client         *Client
 	currentSession *Session
 	currentUser    *User
-	callbacks      []AuthStateChangeCallback
+	callbacks      []authCallback
+	nextCallbackID uint64
 	mu             sync.RWMutex
 
 	// Token auto-refresh
@@ -29,7 +36,7 @@ type Auth struct {
 func newAuth(c *Client) *Auth {
 	return &Auth{
 		client:    c,
-		callbacks: make([]AuthStateChangeCallback, 0),
+		callbacks: make([]authCallback, 0),
 	}
 }
 
@@ -134,15 +141,16 @@ type SignInOptions struct {
 
 // SignInWithOAuth returns the URL to initiate an OAuth flow.
 func (a *Auth) SignInWithOAuth(provider OAuthProvider, redirectTo string, scopes []string) (string, error) {
-	params := []string{fmt.Sprintf("provider=%s", provider)}
+	q := url.Values{}
+	q.Set("provider", string(provider))
 	if redirectTo != "" {
-		params = append(params, "redirect_to="+url.QueryEscape(redirectTo))
+		q.Set("redirect_to", redirectTo)
 	}
 	if len(scopes) > 0 {
-		params = append(params, "scopes="+url.QueryEscape(strings.Join(scopes, " ")))
+		q.Set("scopes", strings.Join(scopes, " "))
 	}
 
-	return fmt.Sprintf("%s/auth/authorize?%s", a.client.config.APIURL, strings.Join(params, "&")), nil
+	return fmt.Sprintf("%s/auth/authorize?%s", a.client.config.APIURL, q.Encode()), nil
 }
 
 // SignInWithOTP sends a magic link or OTP to the given email or phone.
@@ -342,8 +350,9 @@ func (a *Auth) ExchangeCodeForSession(ctx context.Context, code string) (*AuthRe
 // Returns an unsubscribe function that removes the callback.
 func (a *Auth) OnAuthStateChange(callback AuthStateChangeCallback) func() {
 	a.mu.Lock()
-	idx := len(a.callbacks)
-	a.callbacks = append(a.callbacks, callback)
+	id := a.nextCallbackID
+	a.nextCallbackID++
+	a.callbacks = append(a.callbacks, authCallback{id: id, fn: callback})
 	a.mu.Unlock()
 
 	// Fire immediately with current state
@@ -358,8 +367,11 @@ func (a *Auth) OnAuthStateChange(callback AuthStateChangeCallback) func() {
 	return func() {
 		a.mu.Lock()
 		defer a.mu.Unlock()
-		if idx < len(a.callbacks) {
-			a.callbacks = append(a.callbacks[:idx], a.callbacks[idx+1:]...)
+		for i, cb := range a.callbacks {
+			if cb.id == id {
+				a.callbacks = append(a.callbacks[:i], a.callbacks[i+1:]...)
+				return
+			}
 		}
 	}
 }
@@ -564,14 +576,14 @@ func (a *Auth) clearSession() {
 
 func (a *Auth) notifyStateChange(event AuthChangeEvent, session *Session) {
 	a.mu.RLock()
-	cbs := make([]AuthStateChangeCallback, len(a.callbacks))
+	cbs := make([]authCallback, len(a.callbacks))
 	copy(cbs, a.callbacks)
 	a.mu.RUnlock()
 
 	for _, cb := range cbs {
 		func() {
 			defer func() { recover() }()
-			cb(event, session)
+			cb.fn(event, session)
 		}()
 	}
 }

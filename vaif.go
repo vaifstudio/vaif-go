@@ -18,8 +18,17 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+// maxResponseBodySize limits the maximum response body size to 64 MB
+// to prevent denial-of-service from malicious servers sending unlimited data.
+const maxResponseBodySize = 64 << 20 // 64 MB
+
+// maxRetryAfterSeconds caps the Retry-After header to prevent a malicious
+// server from causing unbounded sleep.
+const maxRetryAfterSeconds = 300 // 5 minutes
 
 // Client is the main VAIF Studio client. It holds configuration and provides
 // access to database, auth, storage, functions, realtime, and AI sub-clients.
@@ -27,6 +36,7 @@ import (
 type Client struct {
 	config      VaifConfig
 	accessToken string
+	tokenMu     sync.RWMutex // protects accessToken
 	httpClient  *http.Client
 	logger      Logger
 
@@ -153,11 +163,15 @@ func WithLogger(l Logger) Option {
 
 // SetAccessToken sets the Bearer token for authenticated requests.
 func (c *Client) SetAccessToken(token string) {
+	c.tokenMu.Lock()
 	c.accessToken = token
+	c.tokenMu.Unlock()
 }
 
 // GetAccessToken returns the current access token.
 func (c *Client) GetAccessToken() string {
+	c.tokenMu.RLock()
+	defer c.tokenMu.RUnlock()
 	return c.accessToken
 }
 
@@ -207,13 +221,18 @@ func (c *Client) request(ctx context.Context, method, path string, body any, par
 		if c.isRetryable(raw.StatusCode, nil) && attempt < maxAttempts-1 {
 			lastErr = fmt.Errorf("HTTP %d", raw.StatusCode)
 
-			// Honor Retry-After header
+			// Honor Retry-After header (capped to prevent malicious unbounded sleep)
 			if retryAfter := raw.Headers["retry-after"]; retryAfter != "" {
 				if secs, err := strconv.Atoi(retryAfter); err == nil {
-					select {
-					case <-ctx.Done():
-						return nil, ctx.Err()
-					case <-time.After(time.Duration(secs) * time.Second):
+					if secs > maxRetryAfterSeconds {
+						secs = maxRetryAfterSeconds
+					}
+					if secs > 0 {
+						select {
+						case <-ctx.Done():
+							return nil, ctx.Err()
+						case <-time.After(time.Duration(secs) * time.Second):
+						}
 					}
 					// Skip the normal backoff delay on next iteration since we already waited
 					continue
@@ -260,8 +279,8 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, p
 		req.Header.Set(k, v)
 	}
 
-	if c.accessToken != "" {
-		req.Header.Set("Authorization", "Bearer "+c.accessToken)
+	if token := c.GetAccessToken(); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	c.debug("%s %s", method, path)
@@ -272,7 +291,8 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, p
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	// Limit response body reads to prevent OOM from malicious servers
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize))
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
@@ -380,6 +400,21 @@ func parseResponse[T any](raw *apiRawResponse) *ApiResponse[T] {
 
 func (c *Client) debug(format string, args ...any) {
 	if c.logger != nil {
-		c.logger.Printf("[vaif] "+format, args...)
+		msg := fmt.Sprintf(format, args...)
+		// Mask credentials in debug output to prevent accidental exposure
+		msg = maskSecret(msg, c.config.APIKey)
+		if token := c.GetAccessToken(); token != "" {
+			msg = maskSecret(msg, token)
+		}
+		c.logger.Printf("[vaif] %s", msg)
 	}
+}
+
+// maskSecret replaces a secret value with a masked version in a string.
+func maskSecret(s, secret string) string {
+	if secret == "" || len(secret) < 8 {
+		return strings.ReplaceAll(s, secret, "***")
+	}
+	masked := secret[:4] + "***" + secret[len(secret)-4:]
+	return strings.ReplaceAll(s, secret, masked)
 }
