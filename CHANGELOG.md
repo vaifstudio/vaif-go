@@ -127,14 +127,18 @@ dependency is `github.com/gorilla/websocket` v1.5.3.
 The generated methods and types follow the API's OpenAPI description and
 change when the API changes them; the changelog lists each such change.
 
-- `Client.Operations` has 801 methods generated from the VAIF Studio OpenAPI
+- `Client.Operations` has 775 methods generated from the VAIF Studio OpenAPI
   description, with typed JSON responses, binary responses and server-sent
   event streams. A failed read of an event stream's body returns an `*Error`
   matching `ErrNetwork` or `ErrTimeout`. `OperationsTable` describes them, and
-  `UngeneratedOperations` lists the 142 operations without a generated method
-  and the reason for each. 108 of them are the operations VAIF's own staff
-  tools use (`/admin/*` and `/auth/impersonate/*`), listed as
-  `platform staff only`.
+  `UngeneratedOperations` lists the 168 operations without a generated method
+  and the reason for each.
+- Staff-only operations are not generated, including the ones outside
+  `/admin`. The 134 operations the API answers only for VAIF platform staff
+  are listed as `platform staff only`: every operation under `/admin/*` and
+  `/auth/impersonate/*`, plus feature flags (`/flags`), enterprise contract
+  and invoice writes, `GET /ai/copilot/stats` and documentation edits under
+  `/docs`.
 
 ### Errors
 

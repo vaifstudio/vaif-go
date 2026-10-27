@@ -592,8 +592,8 @@ for _, file := range built.Files() {
 
 ### Generated API operations
 
-`client.Operations` has 801 methods generated from the OpenAPI description of
-the VAIF Studio API, one for each operation except the 142 that
+`client.Operations` has 775 methods generated from the OpenAPI description of
+the VAIF Studio API, one for each operation except the 168 that
 `vaif.UngeneratedOperations()` lists. They use the same transport, session
 handling, retries and errors as the rest of the client.
 
@@ -617,10 +617,13 @@ fmt.Println(project)
   returns a `*vaif.Error` matching `vaif.ErrNetwork` (or `vaif.ErrTimeout`),
   and the end of the stream returns `io.EOF`.
 - `vaif.OperationsTable()` describes every generated method, and
-  `vaif.UngeneratedOperations()` gives the reason each of the 142 other
-  operations has no method. 108 of them are the operations VAIF's own staff
-  tools use (`/admin/*` and `/auth/impersonate/*`), listed with the reason
-  `platform staff only`.
+  `vaif.UngeneratedOperations()` gives the reason each of the 168 other
+  operations has no method. 134 of them are listed with the reason
+  `platform staff only`: the API answers them only for VAIF platform staff.
+  They are every operation under `/admin/*` and `/auth/impersonate/*`, and
+  the staff-only operations outside those paths: feature flags (`/flags`),
+  enterprise contract and invoice writes, Verament usage statistics
+  (`GET /ai/copilot/stats`) and documentation edits under `/docs`.
 - Each operation requires the credentials the API requires for it: a project
   key, an end-user session, or a console session on a platform client.
 

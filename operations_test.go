@@ -126,7 +126,7 @@ func TestGeneratedTableCoversTheSpec(t *testing.T) {
 	}
 	sort.Strings(want)
 	sort.Strings(got)
-	// 943 operations: 801 generated and 142 listed as not generated.
+	// 943 operations: 775 generated and 168 listed as not generated.
 	if len(want) != 943 || len(got) != 943 {
 		t.Fatalf("the OpenAPI description has %d operations and the tables %d, want 943 in both", len(want), len(got))
 	}
