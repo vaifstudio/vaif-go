@@ -1,74 +1,32 @@
-// Package vaif provides the official Go SDK for VAIF Studio, a backend-as-a-service
-// platform. It provides type-safe access to database, auth, storage, serverless
-// functions, realtime subscriptions, and AI code generation.
+// Package vaif is the Go client for the VAIF Studio API.
 //
-// # Quick Start
+// It covers a project's end-user auth, table queries, file storage,
+// functions, realtime database changes, VAIF Verament and the generated API
+// operations. Every call takes a context.Context, applies a per-attempt
+// timeout, retries transient failures with bounded exponential backoff, and
+// returns *Error values that match sentinel errors through errors.Is:
 //
-// Create a client and start making requests:
-//
-//	client := vaif.NewClient("your-project-id", "your-api-key")
-//	defer client.Close()
-//
-//	ctx := context.Background()
-//
-//	// Query the database
-//	result, err := client.DB.From("users").Select("*").Eq("active", true).Execute(ctx)
-//
-//	// Authenticate
-//	resp, err := client.Auth.SignInWithPassword(ctx, vaif.SignInOptions{
-//	    Email: "user@example.com", Password: "secret",
-//	})
-//
-//	// Upload a file
-//	f, _ := os.Open("photo.jpg")
-//	upload, err := client.Storage.From("avatars").Upload(ctx, "photo.jpg", f, nil)
-//
-//	// Call an edge function
-//	fn, err := client.Functions.Invoke(ctx, "send-email", map[string]any{"to": "a@b.com"}, nil)
-//
-//	// Generate schema with AI
-//	schema, err := client.AI.GenerateSchema(ctx, vaif.SchemaGenerationRequest{
-//	    Prompt: "Create a blog with posts and comments",
-//	    Format: "sql",
-//	}, nil)
-//
-// # Error Handling
-//
-// All errors support sentinel matching via errors.Is:
-//
-//	result, err := client.DB.From("users").Select("*").Single(ctx)
-//	if errors.Is(err, vaif.ErrNotFound) {
-//	    // handle missing resource
+//	client, err := vaif.NewClient("YOUR_PROJECT_ID", "vk_pub_...")
+//	if err != nil {
+//		log.Fatal(err)
 //	}
-//	if errors.Is(err, vaif.ErrUnauthorized) {
-//	    // handle auth failure
+//	if _, err := client.Auth.SignIn(ctx, "ada@example.com", "password"); err != nil {
+//		log.Fatal(err)
 //	}
+//	todos, err := client.From("todos").Eq("done", false).Order("created_at", true).Limit(20).List(ctx)
+//	if err != nil {
+//		log.Fatal(err)
+//	}
+//	fmt.Println(todos.Count)
 //
-// # Configuration
+// Only replay-safe requests (GET, HEAD, OPTIONS, and calls marked idempotent)
+// are retried, on 429, 500, 502, 503 and 504 responses and on network errors;
+// a request that failed before a connection was opened is retried for any
+// method. Access tokens are refreshed 30 seconds before they expire and once
+// after the API rejects one with a 401 response, and concurrent refreshes
+// share one request.
 //
-// Use functional options to customize the client:
-//
-//	client := vaif.NewClient("project-id", "api-key",
-//	    vaif.WithTimeout(10000),
-//	    vaif.WithRetry(3, 500*time.Millisecond),
-//	    vaif.WithDebug(true),
-//	    vaif.WithHeaders(map[string]string{"X-Custom": "value"}),
-//	)
-//
-// # Realtime Subscriptions
-//
-// Subscribe to database changes over WebSocket:
-//
-//	client.Realtime.Connect(nil)
-//	ch := client.Realtime.Channel("room:lobby")
-//	ch.OnPostgresChanges("INSERT", "public", "messages", func(payload any) {
-//	    fmt.Println("New message:", payload)
-//	})
-//	ch.Subscribe(nil)
-//
-// # Thread Safety
-//
-// Client and all sub-clients are safe for concurrent use from multiple goroutines.
-// Auth sessions are protected by sync.RWMutex, and realtime channels handle
-// concurrent subscribe/unsubscribe operations safely.
+// Realtime streams a table's database changes. There is no automatic
+// reconnection: after an error, call Subscribe again. Operations exposes the
+// operations generated from the API's OpenAPI description.
 package vaif

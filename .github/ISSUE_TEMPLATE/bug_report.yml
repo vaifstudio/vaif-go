@@ -1,0 +1,40 @@
+name: Bug report
+description: Report a defect in the Go SDK.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Report security vulnerabilities privately to security@vaif.studio, as described in SECURITY.md, not here.
+        Remove access tokens, refresh tokens, API keys and other credentials from everything you paste.
+  - type: input
+    id: sdk-version
+    attributes:
+      label: SDK version
+      description: The version of github.com/vaifstudio/vaif-go in your go.mod.
+      placeholder: v1.0.0
+    validations:
+      required: true
+  - type: input
+    id: go-version
+    attributes:
+      label: Go version and operating system
+      description: The output of `go version`.
+      placeholder: go version go1.27.3 linux/amd64
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened
+      description: What you expected, what happened instead, and the error's Code and RequestID if there is one.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: A minimal program or test that reproduces the problem.
+      render: go
+    validations:
+      required: true

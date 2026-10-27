@@ -2,164 +2,79 @@ package vaif
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"io"
 	"net/http"
-	neturl "net/url"
+	"net/url"
 	"strings"
 	"time"
 )
 
-// Functions provides edge function invocation and management.
-// All methods require a context.Context for cancellation and timeout support.
-type Functions struct {
+// FunctionsClient invokes the project's deployed functions.
+type FunctionsClient struct {
 	client *Client
 }
 
-// Invoke calls an edge function by name with the given body and options.
-// The function response content type determines how the data is returned:
-// JSON is unmarshalled, text is returned as string, binary as []byte.
-//
-//	result, err := client.Functions.Invoke(ctx, "send-email", map[string]any{
-//	    "to": "user@example.com",
-//	    "subject": "Hello",
-//	}, nil)
-func (f *Functions) Invoke(ctx context.Context, name string, body any, opts *FunctionInvokeOptions) (*FunctionResponse[any], error) {
-	if opts == nil {
-		opts = &FunctionInvokeOptions{}
-	}
+// InvokeOptions shapes the request the function sees.
+type InvokeOptions struct {
+	Method     string            // GET, POST (default), PUT, PATCH, DELETE
+	Path       string            // default "/"
+	Query      map[string]string // query parameters passed to the function
+	Headers    map[string]string // headers passed to the function
+	Timeout    time.Duration     // overrides the client timeout for this call
+	Idempotent bool              // allow retries on transient failures
+}
 
-	method := opts.Method
+var invokeMethods = map[string]bool{"GET": true, "POST": true, "PUT": true, "PATCH": true, "DELETE": true}
+
+// Invoke calls the function name (or id) with body (JSON-encoded; nil for
+// none) and returns its HTTP response. A non-2xx response is returned as an
+// *Error whose Body holds the function's response; a 401 the function
+// returned is returned the same way and does not refresh the session.
+// Invocations are not retried unless opts.Idempotent is set. When the API
+// itself refuses the session's access token, the session is refreshed and
+// the request sent once more: the function did not run.
+func (f *FunctionsClient) Invoke(ctx context.Context, name string, body any, opts *InvokeOptions) (*FunctionResponse, error) {
+	if name == "" {
+		return nil, invalidArg("function name must not be empty")
+	}
+	o := InvokeOptions{}
+	if opts != nil {
+		o = *opts
+	}
+	method := strings.ToUpper(o.Method)
 	if method == "" {
 		method = "POST"
 	}
-
-	config := f.client.GetConfig()
-	url := fmt.Sprintf("%s/functions/%s", config.APIURL, neturl.PathEscape(name))
-
-	var bodyReader io.Reader
+	if !invokeMethods[method] {
+		return nil, invalidArg("method must be GET, POST, PUT, PATCH or DELETE")
+	}
+	path := o.Path
+	if path == "" {
+		path = "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		return nil, invalidArg("path must start with '/'")
+	}
+	// Always the envelope form: a raw body that happened to contain "method"
+	// or "path" keys would otherwise be misread by the API as an envelope.
+	envelope := map[string]any{"method": method, "path": path}
+	if len(o.Query) > 0 {
+		envelope["query"] = o.Query
+	}
+	if len(o.Headers) > 0 {
+		envelope["headers"] = o.Headers
+	}
 	if body != nil {
-		jsonBytes, err := json.Marshal(body)
-		if err != nil {
-			return nil, fmt.Errorf("marshal function body: %w", err)
-		}
-		bodyReader = strings.NewReader(string(jsonBytes))
+		envelope["body"] = body
 	}
-
-	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
-	if err != nil {
-		return nil, fmt.Errorf("create function request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Project-ID", config.ProjectID)
-	req.Header.Set("apikey", config.APIKey)
-
-	for k, v := range config.Headers {
-		req.Header.Set(k, v)
-	}
-	for k, v := range opts.Headers {
-		req.Header.Set(k, v)
-	}
-
-	if token := f.client.GetAccessToken(); token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-
-	timeout := config.Timeout
-	if opts.Timeout > 0 {
-		timeout = opts.Timeout
-	}
-
-	httpClient := &http.Client{
-		Timeout: time.Duration(timeout) * time.Millisecond,
-	}
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return &FunctionResponse[any]{
-			Error: &FunctionError{Message: err.Error(), Name: name, sentinel: ErrTimeout},
-		}, nil
-	}
-	defer resp.Body.Close()
-
-	// Limit function response body to 64 MB to prevent OOM
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-	if err != nil {
-		return &FunctionResponse[any]{
-			Error: &FunctionError{Message: "failed to read response", Name: name},
-		}, nil
-	}
-
-	contentType := resp.Header.Get("Content-Type")
-
-	var data any
-	if strings.HasPrefix(contentType, "application/json") {
-		json.Unmarshal(respBody, &data)
-	} else if strings.HasPrefix(contentType, "text/") {
-		data = string(respBody)
-	} else {
-		data = respBody
-	}
-
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return &FunctionResponse[any]{Data: data}, nil
-	}
-
-	msg := fmt.Sprintf("Function invocation failed: %d", resp.StatusCode)
-	if m, ok := data.(map[string]any); ok {
-		if v, ok := m["message"].(string); ok {
-			msg = v
-		}
-	}
-
-	return &FunctionResponse[any]{
-		Error: &FunctionError{Message: msg, Status: resp.StatusCode, Name: name, sentinel: sentinelForStatus(resp.StatusCode)},
-	}, nil
-}
-
-// CreateURL returns the URL for direct function invocation (e.g. for webhooks).
-func (f *Functions) CreateURL(name string) string {
-	return fmt.Sprintf("%s/functions/%s", f.client.config.APIURL, neturl.PathEscape(name))
-}
-
-// List returns all deployed functions.
-func (f *Functions) List(ctx context.Context) ([]map[string]any, error) {
-	raw, err := f.client.request(ctx, "GET", "/functions", nil, nil)
+	resp, err := f.client.send(ctx, request{
+		method:     http.MethodPost,
+		path:       "/functions/" + url.PathEscape(name) + "/invoke",
+		body:       envelope,
+		timeout:    o.Timeout,
+		idempotent: boolPtr(o.Idempotent),
+	}, false)
 	if err != nil {
 		return nil, err
 	}
-
-	resp := parseResponse[[]map[string]any](raw)
-	if resp.Error != nil {
-		return nil, &FunctionError{
-			Message:  resp.Error.Message,
-			Status:   resp.Status,
-			Name:     "list",
-			sentinel: resp.Error.sentinel,
-		}
-	}
-
-	return resp.Data, nil
-}
-
-// Get returns details for a specific deployed function.
-func (f *Functions) Get(ctx context.Context, name string) (map[string]any, error) {
-	raw, err := f.client.request(ctx, "GET", "/functions/"+neturl.PathEscape(name), nil, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp := parseResponse[map[string]any](raw)
-	if resp.Error != nil {
-		return nil, &FunctionError{
-			Message:  resp.Error.Message,
-			Status:   resp.Status,
-			Name:     name,
-			sentinel: resp.Error.sentinel,
-		}
-	}
-
-	return resp.Data, nil
+	return &FunctionResponse{Status: resp.status, Header: resp.header, Body: resp.body}, nil
 }

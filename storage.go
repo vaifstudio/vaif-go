@@ -1,443 +1,198 @@
 package vaif
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"fmt"
-	"io"
-	"mime"
-	"mime/multipart"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
 )
 
-// Storage provides file storage operations including upload, download, and
-// bucket management. All operations require a context.Context.
-type Storage struct {
+// maxObjectBytes is the largest single-part object a presigned PUT accepts.
+const maxObjectBytes = 5 << 30
+
+// StorageClient uploads, downloads and signs URLs for the project's objects.
+// Bucket is optional everywhere; without it the project's default bucket is
+// used. Keys are relative paths such as "avatars/u1.png".
+type StorageClient struct {
 	client *Client
 }
 
-// From returns a StorageBucket for the given bucket name.
-//
-//	bucket := client.Storage.From("avatars")
-//	result, err := bucket.Upload(ctx, "photo.jpg", reader, nil)
-func (s *Storage) From(bucket string) *StorageBucket {
-	return &StorageBucket{client: s.client, bucket: bucket}
+// ObjectOptions selects a bucket.
+type ObjectOptions struct {
+	Bucket string
 }
 
-// ListBuckets returns all storage buckets.
-func (s *Storage) ListBuckets(ctx context.Context) ([]Bucket, error) {
-	raw, err := s.client.request(ctx, "GET", "/storage/buckets", nil, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp := parseResponse[[]Bucket](raw)
-	if resp.Error != nil {
-		return nil, &StorageError{Message: resp.Error.Message, StatusCode: strconv.Itoa(resp.Status), Err: resp.Error.Code, sentinel: resp.Error.sentinel}
-	}
-
-	return resp.Data, nil
+// UploadOptions configures Upload.
+type UploadOptions struct {
+	Bucket      string
+	ContentType string // default application/octet-stream
 }
 
-// CreateBucket creates a new storage bucket.
-func (s *Storage) CreateBucket(ctx context.Context, name string, opts *CreateBucketOptions) (*Bucket, error) {
-	body := map[string]any{"name": name, "public": false}
-	if opts != nil {
-		body["public"] = opts.Public
-		if opts.FileSizeLimit > 0 {
-			body["fileSizeLimit"] = opts.FileSizeLimit
-		}
-		if len(opts.AllowedMimeTypes) > 0 {
-			body["allowedMimeTypes"] = opts.AllowedMimeTypes
+func checkKey(key string) error {
+	if key == "" {
+		return invalidArg("key must not be empty")
+	}
+	if strings.HasPrefix(key, "/") {
+		return invalidArg("key must be relative")
+	}
+	for _, part := range strings.Split(key, "/") {
+		if part == ".." {
+			return invalidArg("key must not contain '..' segments")
 		}
 	}
-
-	raw, err := s.client.request(ctx, "POST", "/storage/buckets", body, nil)
-	if err != nil {
-		return nil, err
+	for _, r := range key {
+		if r < 32 {
+			return invalidArg("key must not contain control characters")
+		}
 	}
-
-	resp := parseResponse[Bucket](raw)
-	if resp.Error != nil {
-		return nil, &StorageError{Message: resp.Error.Message, StatusCode: strconv.Itoa(resp.Status), Err: resp.Error.Code, sentinel: resp.Error.sentinel}
-	}
-
-	return &resp.Data, nil
-}
-
-// CreateBucketOptions configures bucket creation.
-type CreateBucketOptions struct {
-	Public           bool
-	FileSizeLimit    int64
-	AllowedMimeTypes []string
-}
-
-// DeleteBucket deletes a storage bucket.
-func (s *Storage) DeleteBucket(ctx context.Context, name string) error {
-	raw, err := s.client.request(ctx, "DELETE", "/storage/buckets/"+url.PathEscape(name), nil, nil)
-	if err != nil {
-		return err
-	}
-
-	resp := parseResponse[any](raw)
-	if resp.Error != nil {
-		return &StorageError{Message: resp.Error.Message, StatusCode: strconv.Itoa(resp.Status), Err: resp.Error.Code, sentinel: resp.Error.sentinel}
-	}
-
 	return nil
 }
 
-// StorageBucket provides operations on a specific bucket.
-type StorageBucket struct {
-	client *Client
-	bucket string
-}
-
-// Upload uploads a file to the bucket. The path is the destination path within
-// the bucket. If opts.ContentType is empty, it is detected from the file extension.
-func (sb *StorageBucket) Upload(ctx context.Context, path string, data io.Reader, opts *UploadOptions) (*UploadResult, error) {
-	if opts == nil {
-		opts = &UploadOptions{}
-	}
-
-	config := sb.client.GetConfig()
-
-	// Build multipart form
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-
-	filename := filepath.Base(path)
-	contentType := opts.ContentType
-	if contentType == "" {
-		contentType = detectContentType(path)
-	}
-
-	part, err := writer.CreateFormFile("file", filename)
-	if err != nil {
-		return nil, fmt.Errorf("create form file: %w", err)
-	}
-
-	if _, err := io.Copy(part, data); err != nil {
-		return nil, fmt.Errorf("copy file data: %w", err)
-	}
-
-	if contentType != "" {
-		writer.WriteField("contentType", contentType)
-	}
-	if opts.CacheControl != "" {
-		writer.WriteField("cacheControl", opts.CacheControl)
-	}
-	if opts.Upsert {
-		writer.WriteField("upsert", "true")
-	}
-	if opts.Metadata != nil {
-		metaBytes, _ := json.Marshal(opts.Metadata)
-		writer.WriteField("metadata", string(metaBytes))
-	}
-
-	writer.Close()
-
-	uploadURL := fmt.Sprintf("%s/storage/%s/%s", config.APIURL, url.PathEscape(sb.bucket), encodePathSegments(path))
-	req, err := http.NewRequestWithContext(ctx, "POST", uploadURL, &body)
-	if err != nil {
+func target(key, bucket string) (map[string]any, error) {
+	if err := checkKey(key); err != nil {
 		return nil, err
 	}
-
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	req.Header.Set("X-Project-ID", config.ProjectID)
-	req.Header.Set("apikey", config.APIKey)
-
-	if token := sb.client.GetAccessToken(); token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+	t := map[string]any{"key": key}
+	if bucket != "" {
+		t["bucket"] = bucket
 	}
-
-	resp, err := sb.client.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("upload request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Limit response body read (upload responses should be small)
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, fmt.Errorf("read upload response: %w", err)
-	}
-
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		var result UploadResult
-		if err := json.Unmarshal(respBody, &result); err != nil {
-			return nil, fmt.Errorf("parse upload result: %w", err)
-		}
-		return &result, nil
-	}
-
-	var errBody map[string]any
-	json.Unmarshal(respBody, &errBody)
-	msg, _ := errBody["message"].(string)
-	if msg == "" {
-		msg = fmt.Sprintf("Upload failed: %d", resp.StatusCode)
-	}
-	return nil, &StorageError{Message: msg, StatusCode: strconv.Itoa(resp.StatusCode), Err: "UPLOAD_ERROR", sentinel: sentinelForStatus(resp.StatusCode)}
+	return t, nil
 }
 
-// UploadWithProgress uploads a file with a progress callback. The progressFn
-// is called periodically with the number of bytes transferred and total size.
-func (sb *StorageBucket) UploadWithProgress(ctx context.Context, path string, data io.Reader, size int64, progressFn ProgressFunc, opts *UploadOptions) (*UploadResult, error) {
-	pr := &progressReader{
-		reader:     data,
-		total:      size,
-		progressFn: progressFn,
-	}
-	return sb.Upload(ctx, path, pr, opts)
+type urlBody struct {
+	URL string `json:"url"`
 }
 
-// UploadFile uploads a local file to the bucket. Content type is detected from
-// the file extension.
-func (sb *StorageBucket) UploadFile(ctx context.Context, remotePath, localPath string, opts *UploadOptions) (*UploadResult, error) {
-	f, err := os.Open(localPath)
-	if err != nil {
-		return nil, fmt.Errorf("open file: %w", err)
-	}
-	defer f.Close()
-
-	if opts == nil {
-		opts = &UploadOptions{}
-	}
-	if opts.ContentType == "" {
-		opts.ContentType = detectContentType(localPath)
-	}
-
-	return sb.Upload(ctx, remotePath, f, opts)
-}
-
-// Download downloads a file from the bucket as bytes. Use transform to apply
-// image transformations (resize, format conversion, etc.).
-func (sb *StorageBucket) Download(ctx context.Context, path string, transform *ImageTransformOptions) ([]byte, error) {
-	config := sb.client.GetConfig()
-	downloadURL := fmt.Sprintf("%s/storage/%s/%s", config.APIURL, url.PathEscape(sb.bucket), encodePathSegments(path))
-
-	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	if transform != nil {
-		q := req.URL.Query()
-		if transform.Width > 0 {
-			q.Set("width", strconv.Itoa(transform.Width))
-		}
-		if transform.Height > 0 {
-			q.Set("height", strconv.Itoa(transform.Height))
-		}
-		if transform.Resize != "" {
-			q.Set("resize", transform.Resize)
-		}
-		if transform.Format != "" {
-			q.Set("format", transform.Format)
-		}
-		if transform.Quality > 0 {
-			q.Set("quality", strconv.Itoa(transform.Quality))
-		}
-		req.URL.RawQuery = q.Encode()
-	}
-
-	req.Header.Set("apikey", config.APIKey)
-	if token := sb.client.GetAccessToken(); token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-
-	resp, err := sb.client.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("download request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		// Limit download size to prevent OOM from malicious servers (256 MB)
-		return io.ReadAll(io.LimitReader(resp.Body, 256<<20))
-	}
-
-	return nil, &StorageError{
-		Message:    fmt.Sprintf("Download failed: %d", resp.StatusCode),
-		StatusCode: strconv.Itoa(resp.StatusCode),
-		Err:        "DOWNLOAD_ERROR",
-		sentinel:   sentinelForStatus(resp.StatusCode),
-	}
-}
-
-// DownloadToFile downloads a file from the bucket and writes it to a local file.
-func (sb *StorageBucket) DownloadToFile(ctx context.Context, remotePath, localPath string, transform *ImageTransformOptions) error {
-	data, err := sb.Download(ctx, remotePath, transform)
-	if err != nil {
-		return err
-	}
-
-	dir := filepath.Dir(localPath)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create directory: %w", err)
-	}
-
-	if err := os.WriteFile(localPath, data, 0o644); err != nil {
-		return fmt.Errorf("write file: %w", err)
-	}
-
-	return nil
-}
-
-// GetPublicURL returns the public URL for a file. The file must be in a public bucket.
-func (sb *StorageBucket) GetPublicURL(path string) string {
-	config := sb.client.GetConfig()
-	return fmt.Sprintf("%s/storage/%s/%s", config.APIURL, url.PathEscape(sb.bucket), encodePathSegments(path))
-}
-
-// CreateSignedURL creates a signed URL for temporary file access.
-// ExpiresIn is in seconds.
-func (sb *StorageBucket) CreateSignedURL(ctx context.Context, path string, opts SignedURLOptions) (string, error) {
-	body := map[string]any{"expiresIn": opts.ExpiresIn}
-	if opts.Transform != nil {
-		body["transform"] = opts.Transform
-	}
-	if opts.Download != nil {
-		body["download"] = opts.Download
-	}
-
-	raw, err := sb.client.request(ctx, "POST", fmt.Sprintf("/storage/%s/%s/sign", url.PathEscape(sb.bucket), encodePathSegments(path)), body, nil)
+func (s *StorageClient) mint(ctx context.Context, path string, payload map[string]any, idempotent bool) (string, error) {
+	resp, err := s.client.send(ctx, request{method: http.MethodPost, path: path, body: payload, idempotent: boolPtr(idempotent)}, false)
 	if err != nil {
 		return "", err
 	}
-
-	resp := parseResponse[map[string]any](raw)
-	if resp.Error != nil {
-		return "", &StorageError{Message: resp.Error.Message, StatusCode: strconv.Itoa(resp.Status), Err: resp.Error.Code, sentinel: resp.Error.sentinel}
+	var body urlBody
+	if err := decodeJSON(resp, &body); err != nil {
+		return "", err
 	}
-
-	signedURL, _ := resp.Data["signedUrl"].(string)
-	return signedURL, nil
+	if body.URL == "" {
+		return "", &Error{Kind: ErrBadResponse, Status: resp.status, Message: "response did not include a URL"}
+	}
+	if !secureStorageURL(body.URL) {
+		// The URL carries a signature, so it stays out of the error.
+		return "", &Error{Kind: ErrBadResponse, Status: resp.status, Code: "INSECURE_STORAGE_URL", Message: "API returned a storage URL that is not https"}
+	}
+	return body.URL, nil
 }
 
-// List lists files in the bucket under the given path prefix.
-func (sb *StorageBucket) List(ctx context.Context, path string, opts *ListFilesOptions) ([]FileObject, error) {
-	body := map[string]any{"prefix": path}
-	if opts != nil {
-		if opts.Limit > 0 {
-			body["limit"] = opts.Limit
-		}
-		if opts.Offset > 0 {
-			body["offset"] = opts.Offset
-		}
-		if opts.Search != "" {
-			body["search"] = opts.Search
-		}
-		if opts.SortBy != nil {
-			body["sortBy"] = opts.SortBy
-		}
+// secureStorageURL reports whether raw, a signed URL the API issued, may carry
+// an object's bytes: it must be absolute https, or http for the loopback hosts
+// allowsCleartext names, as the base URL must.
+func secureStorageURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return false
 	}
+	return u.Scheme == "https" || (u.Scheme == "http" && allowsCleartext(u.Hostname()))
+}
 
-	raw, err := sb.client.request(ctx, "POST", fmt.Sprintf("/storage/%s/list", url.PathEscape(sb.bucket)), body, nil)
+// CreateSignedURL returns a time-limited download URL (the API issues it for
+// 10 minutes). The URL must be https, or http on a loopback host; any other
+// URL is refused with code INSECURE_STORAGE_URL.
+func (s *StorageClient) CreateSignedURL(ctx context.Context, key string, opts *ObjectOptions) (string, error) {
+	payload, err := target(key, bucketOf(opts))
+	if err != nil {
+		return "", err
+	}
+	// Minting a download URL has no side effects, so it may be retried.
+	return s.mint(ctx, "/storage/download-url", payload, true)
+}
+
+// CreateSignedUploadURL returns a time-limited URL that accepts an HTTP PUT
+// of exactly sizeBytes bytes (1 byte to 5 GiB) and, when opts.ContentType is
+// set, exactly that Content-Type: both are signed into the URL, so the object
+// store refuses any other PUT. The API checks the size against the bucket's
+// and project's limits and the storage quota, and meters it. The URL must be
+// https, or http on a loopback host; any other URL is refused with code
+// INSECURE_STORAGE_URL.
+func (s *StorageClient) CreateSignedUploadURL(ctx context.Context, key string, sizeBytes int64, opts *UploadOptions) (string, error) {
+	var bucket, contentType string
+	if opts != nil {
+		bucket, contentType = opts.Bucket, opts.ContentType
+	}
+	payload, err := target(key, bucket)
+	if err != nil {
+		return "", err
+	}
+	if sizeBytes < 1 || sizeBytes > maxObjectBytes {
+		return "", invalidArg("sizeBytes must be between 1 and 5 GiB")
+	}
+	payload["sizeBytes"] = sizeBytes
+	if contentType != "" {
+		payload["contentType"] = contentType
+	}
+	// Metered on the server: never replayed after it may have been received.
+	return s.mint(ctx, "/storage/upload-url", payload, false)
+}
+
+// Upload stores data at key, overwriting any existing object. It mints a
+// presigned URL and PUTs the bytes straight to the object store; the API key
+// and session token are never sent there. The PUT is retried on transient
+// failures, the metered mint is not.
+func (s *StorageClient) Upload(ctx context.Context, key string, data []byte, opts *UploadOptions) (*UploadResult, error) {
+	var bucket, contentType string
+	if opts != nil {
+		bucket, contentType = opts.Bucket, opts.ContentType
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	if len(data) == 0 {
+		return nil, invalidArg("data must not be empty")
+	}
+	if len(data) > maxObjectBytes {
+		return nil, invalidArg("Upload accepts at most 5 GiB per object")
+	}
+	signed, err := s.CreateSignedUploadURL(ctx, key, int64(len(data)), &UploadOptions{Bucket: bucket, ContentType: contentType})
 	if err != nil {
 		return nil, err
 	}
-
-	resp := parseResponse[[]FileObject](raw)
-	if resp.Error != nil {
-		return nil, &StorageError{Message: resp.Error.Message, StatusCode: strconv.Itoa(resp.Status), Err: resp.Error.Code, sentinel: resp.Error.sentinel}
-	}
-
-	return resp.Data, nil
-}
-
-// Move moves/renames a file within the bucket.
-func (sb *StorageBucket) Move(ctx context.Context, fromPath, toPath string) error {
-	body := map[string]any{"from": fromPath, "to": toPath}
-
-	raw, err := sb.client.request(ctx, "POST", fmt.Sprintf("/storage/%s/move", url.PathEscape(sb.bucket)), body, nil)
+	_, err = s.client.do(ctx, request{
+		method:      http.MethodPut,
+		path:        signed,
+		absoluteURL: true,
+		rawBody:     data,
+		contentType: contentType,
+		idempotent:  boolPtr(true),
+	})
 	if err != nil {
-		return err
+		if apiErr, ok := err.(*Error); ok && apiErr.Code == "" {
+			apiErr.Code = "STORAGE_UPLOAD_FAILED"
+		}
+		return nil, err
 	}
-
-	resp := parseResponse[any](raw)
-	if resp.Error != nil {
-		return &StorageError{Message: resp.Error.Message, StatusCode: strconv.Itoa(resp.Status), Err: resp.Error.Code, sentinel: resp.Error.sentinel}
-	}
-
-	return nil
+	return &UploadResult{Key: key, Bucket: bucket, Size: len(data)}, nil
 }
 
-// Copy copies a file within the bucket.
-func (sb *StorageBucket) Copy(ctx context.Context, fromPath, toPath string) error {
-	body := map[string]any{"from": fromPath, "to": toPath}
-
-	raw, err := sb.client.request(ctx, "POST", fmt.Sprintf("/storage/%s/copy", url.PathEscape(sb.bucket)), body, nil)
+// Download returns an object's bytes; errors.Is(err, ErrNotFound) if missing.
+// It asks the API for a signed download URL, as CreateSignedURL does, and
+// reads the object from that URL; the API key and session token are never
+// sent there. Objects larger than 64 MiB are refused with ErrBadResponse.
+func (s *StorageClient) Download(ctx context.Context, key string, opts *ObjectOptions) ([]byte, error) {
+	signed, err := s.CreateSignedURL(ctx, key, opts)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	resp := parseResponse[any](raw)
-	if resp.Error != nil {
-		return &StorageError{Message: resp.Error.Message, StatusCode: strconv.Itoa(resp.Status), Err: resp.Error.Code, sentinel: resp.Error.sentinel}
-	}
-
-	return nil
-}
-
-// Remove deletes one or more files from the bucket.
-func (sb *StorageBucket) Remove(ctx context.Context, paths []string) error {
-	body := map[string]any{"paths": paths}
-
-	raw, err := sb.client.request(ctx, "DELETE", fmt.Sprintf("/storage/%s/delete", url.PathEscape(sb.bucket)), body, nil)
+	resp, err := s.client.do(ctx, request{method: http.MethodGet, path: signed, absoluteURL: true})
 	if err != nil {
-		return err
+		if apiErr, ok := err.(*Error); ok && apiErr.Code == "" {
+			apiErr.Code = "STORAGE_DOWNLOAD_FAILED"
+		}
+		return nil, err
 	}
-
-	resp := parseResponse[any](raw)
-	if resp.Error != nil {
-		return &StorageError{Message: resp.Error.Message, StatusCode: strconv.Itoa(resp.Status), Err: resp.Error.Code, sentinel: resp.Error.sentinel}
-	}
-
-	return nil
+	return resp.body, nil
 }
 
-// encodePathSegments URL-encodes each segment of a path while preserving slashes.
-func encodePathSegments(path string) string {
-	parts := strings.Split(path, "/")
-	for i, p := range parts {
-		parts[i] = url.PathEscape(p)
+func bucketOf(opts *ObjectOptions) string {
+	if opts == nil {
+		return ""
 	}
-	return strings.Join(parts, "/")
-}
-
-// detectContentType returns the MIME type based on file extension.
-func detectContentType(path string) string {
-	ext := filepath.Ext(path)
-	if ext == "" {
-		return "application/octet-stream"
-	}
-	ct := mime.TypeByExtension(ext)
-	if ct == "" {
-		return "application/octet-stream"
-	}
-	return ct
-}
-
-// progressReader wraps an io.Reader to report progress.
-type progressReader struct {
-	reader      io.Reader
-	total       int64
-	transferred int64
-	progressFn  ProgressFunc
-}
-
-func (pr *progressReader) Read(p []byte) (int, error) {
-	n, err := pr.reader.Read(p)
-	pr.transferred += int64(n)
-	if pr.progressFn != nil && n > 0 {
-		pr.progressFn(pr.transferred, pr.total)
-	}
-	return n, err
+	return opts.Bucket
 }

@@ -1,0 +1,41 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The version in go.mod's go directive, and the current Go release.
+        go: ['1.26.10', 'stable']
+    env:
+      # Build with the toolchain installed below; never switch to another.
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+          cache-dependency-path: go.sum
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go mod verify
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+      # The default scan fails only when vulnerable code is reachable.
+      - name: govulncheck, reachable code
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+      # The module scan fails on any advisory for a required module version or
+      # for the Go release in use, reachable or not.
+      - name: govulncheck, every required module and the standard library
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -scan module

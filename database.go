@@ -4,593 +4,436 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
 )
 
-// Database provides type-safe database operations with a fluent query builder.
-// All operations require a context.Context for cancellation and timeout support.
-type Database struct {
-	client *Client
+// MaxLimit is the API's cap on a list query's limit.
+const MaxLimit = 1000
+
+var identifierRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+func isIdentifier(s string) bool { return identifierRE.MatchString(s) }
+
+type orderKey struct {
+	column string
+	desc   bool
 }
 
-// From starts a query on the given table. Chain methods to build the query,
-// then call Execute, Single, or MaybeSingle to run it.
-//
-//	result, err := client.DB.From("users").Select("*").Eq("active", true).Execute(ctx)
-func (d *Database) From(table string) *QueryBuilder {
-	return &QueryBuilder{
-		client:     d.client,
-		table:      table,
-		queryType:  "select",
-		selectCols: "*",
-		filters:    make([]map[string]any, 0),
-		orderSpecs: make([]map[string]any, 0),
-	}
+// Query is an immutable, chainable query against one table
+// (/v1/data/:projectId/:table). Every builder method returns a new Query, so
+// a base query can be shared. Argument errors are reported by the terminal
+// call (List, Get, Insert, ...), never by panicking.
+type Query struct {
+	client  *Client
+	table   string
+	filters []map[string]any
+	order   []orderKey
+	columns []string
+	limit   int
+	offset  int
+	err     error
 }
 
-// Raw executes a raw SQL query with parameterized values (admin only).
-// Use $1, $2, etc. as placeholders in the SQL string.
+func (q *Query) clone() *Query {
+	c := *q
+	c.filters = append([]map[string]any(nil), q.filters...)
+	c.order = append([]orderKey(nil), q.order...)
+	c.columns = append([]string(nil), q.columns...)
+	return &c
+}
+
+func (q *Query) fail(err error) *Query {
+	c := q.clone()
+	if c.err == nil {
+		c.err = err
+	}
+	return c
+}
+
+func (q *Query) clause(column, operator string, value any) *Query {
+	if !isIdentifier(column) {
+		return q.fail(invalidArg("column must be a SQL identifier, got %q", column))
+	}
+	c := q.clone()
+	c.filters = append(c.filters, map[string]any{"field": column, "operator": operator, "value": value})
+	return c
+}
+
+// Eq matches rows where column = value.
+func (q *Query) Eq(column string, value any) *Query { return q.clause(column, "eq", value) }
+
+// Neq matches rows where column != value.
+func (q *Query) Neq(column string, value any) *Query { return q.clause(column, "neq", value) }
+
+// Gt matches rows where column > value.
+func (q *Query) Gt(column string, value any) *Query { return q.clause(column, "gt", value) }
+
+// Gte matches rows where column >= value.
+func (q *Query) Gte(column string, value any) *Query { return q.clause(column, "gte", value) }
+
+// Lt matches rows where column < value.
+func (q *Query) Lt(column string, value any) *Query { return q.clause(column, "lt", value) }
+
+// Lte matches rows where column <= value.
+func (q *Query) Lte(column string, value any) *Query { return q.clause(column, "lte", value) }
+
+// Like matches a case-sensitive SQL LIKE pattern.
+func (q *Query) Like(column, pattern string) *Query { return q.clause(column, "like", pattern) }
+
+// ILike matches a case-insensitive SQL ILIKE pattern.
+func (q *Query) ILike(column, pattern string) *Query { return q.clause(column, "ilike", pattern) }
+
+// In matches rows where column is one of values.
+func (q *Query) In(column string, values ...any) *Query {
+	if len(values) == 0 {
+		return q.fail(invalidArg("In(%q) needs at least one value", column))
+	}
+	return q.clause(column, "in", values)
+}
+
+// Where adds a raw clause, ANDed with the others, e.g. an OR group:
 //
-//	result, err := client.DB.Raw(ctx, "SELECT * FROM users WHERE age > $1", 18)
-func (d *Database) Raw(ctx context.Context, sql string, params ...any) (*QueryResult[[]map[string]any], error) {
-	body := map[string]any{
-		"sql":    sql,
-		"params": params,
+//	q.Where(map[string]any{"OR": []any{
+//		map[string]any{"field": "status", "value": "open"},
+//		map[string]any{"field": "priority", "operator": "gte", "value": 3},
+//	}})
+func (q *Query) Where(clause map[string]any) *Query {
+	if len(clause) == 0 {
+		return q.fail(invalidArg("Where needs a non-empty clause"))
 	}
+	c := q.clone()
+	c.filters = append(c.filters, clause)
+	return c
+}
 
-	raw, err := d.client.request(ctx, "POST", "/db/query", body, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp := parseResponse[map[string]any](raw)
-	if resp.Error != nil {
-		return &QueryResult[[]map[string]any]{
-			Error:  &QueryError{Message: resp.Error.Message, Code: resp.Error.Code, Status: resp.Status, Operation: "Raw", sentinel: resp.Error.sentinel},
-			Status: resp.Status,
-		}, nil
-	}
-
-	rows, _ := resp.Data["rows"].([]any)
-	result := make([]map[string]any, 0, len(rows))
-	for _, row := range rows {
-		if m, ok := row.(map[string]any); ok {
-			result = append(result, m)
+// Select returns only these columns (default: all).
+func (q *Query) Select(columns ...string) *Query {
+	for _, col := range columns {
+		if !isIdentifier(col) {
+			return q.fail(invalidArg("column must be a SQL identifier, got %q", col))
 		}
 	}
-
-	return &QueryResult[[]map[string]any]{Data: result, Status: resp.Status}, nil
+	c := q.clone()
+	c.columns = append([]string(nil), columns...)
+	return c
 }
 
-// RPC executes a stored procedure/function with the given parameters.
-//
-//	result, err := client.DB.RPC(ctx, "get_user_stats", map[string]any{"user_id": "123"})
-func (d *Database) RPC(ctx context.Context, functionName string, params map[string]any) (*QueryResult[any], error) {
-	if params == nil {
-		params = map[string]any{}
+// Order sorts by column; call again to add secondary sort keys.
+func (q *Query) Order(column string, descending bool) *Query {
+	if !isIdentifier(column) {
+		return q.fail(invalidArg("column must be a SQL identifier, got %q", column))
 	}
+	c := q.clone()
+	c.order = append(c.order, orderKey{column: column, desc: descending})
+	return c
+}
 
-	raw, err := d.client.request(ctx, "POST", "/db/rpc/"+url.PathEscape(functionName), params, nil)
-	if err != nil {
-		return nil, err
+// Limit caps the number of rows (1..1000).
+func (q *Query) Limit(n int) *Query {
+	if n < 1 || n > MaxLimit {
+		return q.fail(invalidArg("limit must be between 1 and %d", MaxLimit))
 	}
+	c := q.clone()
+	c.limit = n
+	return c
+}
 
-	resp := parseResponse[any](raw)
-	if resp.Error != nil {
-		return &QueryResult[any]{
-			Error:  &QueryError{Message: resp.Error.Message, Code: resp.Error.Code, Status: resp.Status, Operation: "RPC:" + functionName, sentinel: resp.Error.sentinel},
-			Status: resp.Status,
-		}, nil
+// Offset skips n rows.
+func (q *Query) Offset(n int) *Query {
+	if n < 0 {
+		return q.fail(invalidArg("offset must be >= 0"))
 	}
-
-	return &QueryResult[any]{Data: resp.Data, Status: resp.Status}, nil
+	c := q.clone()
+	c.offset = n
+	return c
 }
 
-// QueryBuilder constructs database queries with fluent method chaining.
-// Create one via Database.From and customize with filter, order, and limit
-// methods before executing.
-type QueryBuilder struct {
-	client     *Client
-	table      string
-	queryType  string // select, insert, update, delete
-	selectCols string
-	insertData any
-	updateData map[string]any
-	filters    []map[string]any
-	orderSpecs []map[string]any
-	limitCount *int
-	offsetCount *int
-	returning  string
-	countOption string
-	negateNext bool
-
-	onConflictColumns []string
-	onConflictAction  string
-	onConflictUpdate  map[string]any
-}
-
-// Select sets the columns to select. Pass "*" for all columns, or a
-// comma-separated list like "id, name, email".
-func (q *QueryBuilder) Select(columns string) *QueryBuilder {
-	q.queryType = "select"
-	q.selectCols = columns
-	return q
-}
-
-// Insert sets data to insert. Accepts a map[string]any for a single row or
-// []map[string]any for batch insert.
-func (q *QueryBuilder) Insert(data any) *QueryBuilder {
-	q.queryType = "insert"
-	q.insertData = data
-	return q
-}
-
-// Update sets data to update. Only the specified columns are modified.
-func (q *QueryBuilder) Update(data map[string]any) *QueryBuilder {
-	q.queryType = "update"
-	q.updateData = data
-	return q
-}
-
-// Delete marks the query as a DELETE operation. Combine with filters to
-// delete specific rows.
-func (q *QueryBuilder) Delete() *QueryBuilder {
-	q.queryType = "delete"
-	return q
-}
-
-// Upsert performs an insert-or-update. If a row with matching conflict columns
-// exists, it is updated with the provided data; otherwise a new row is inserted.
-//
-//	client.DB.From("users").Upsert(data, "email").Execute(ctx)
-func (q *QueryBuilder) Upsert(data any, conflictColumns ...string) *QueryBuilder {
-	q.queryType = "insert"
-	q.insertData = data
-	q.onConflictColumns = conflictColumns
-	q.onConflictAction = "update"
-	return q
-}
-
-// Returning sets which columns to return after insert/update/delete.
-// Pass "*" for all columns or a comma-separated list.
-//
-//	result, err := client.DB.From("users").Insert(data).Returning("id, name").Execute(ctx)
-func (q *QueryBuilder) Returning(columns string) *QueryBuilder {
-	q.returning = columns
-	return q
-}
-
-// OnConflict sets conflict columns for upsert behavior on inserts.
-func (q *QueryBuilder) OnConflict(columns ...string) *QueryBuilder {
-	q.onConflictColumns = columns
-	return q
-}
-
-// DoNothing handles a conflict by doing nothing (skip the insert).
-func (q *QueryBuilder) DoNothing() *QueryBuilder {
-	q.onConflictAction = "nothing"
-	return q
-}
-
-// DoUpdate handles a conflict by updating the given fields.
-func (q *QueryBuilder) DoUpdate(data map[string]any) *QueryBuilder {
-	q.onConflictAction = "update"
-	q.onConflictUpdate = data
-	return q
-}
-
-// --- Filter methods ---
-
-// Eq filters where column equals value.
-func (q *QueryBuilder) Eq(column string, value any) *QueryBuilder {
-	op := "eq"
-	if q.negateNext {
-		op = "neq"
-		q.negateNext = false
-	}
-	q.addFilter(column, op, value)
-	return q
-}
-
-// Neq filters where column does not equal value.
-func (q *QueryBuilder) Neq(column string, value any) *QueryBuilder {
-	op := "neq"
-	if q.negateNext {
-		op = "eq"
-		q.negateNext = false
-	}
-	q.addFilter(column, op, value)
-	return q
-}
-
-// Gt filters where column is greater than value.
-func (q *QueryBuilder) Gt(column string, value any) *QueryBuilder {
-	op := "gt"
-	if q.negateNext {
-		op = "lte"
-		q.negateNext = false
-	}
-	q.addFilter(column, op, value)
-	return q
-}
-
-// Gte filters where column is greater than or equal to value.
-func (q *QueryBuilder) Gte(column string, value any) *QueryBuilder {
-	op := "gte"
-	if q.negateNext {
-		op = "lt"
-		q.negateNext = false
-	}
-	q.addFilter(column, op, value)
-	return q
-}
-
-// Lt filters where column is less than value.
-func (q *QueryBuilder) Lt(column string, value any) *QueryBuilder {
-	op := "lt"
-	if q.negateNext {
-		op = "gte"
-		q.negateNext = false
-	}
-	q.addFilter(column, op, value)
-	return q
-}
-
-// Lte filters where column is less than or equal to value.
-func (q *QueryBuilder) Lte(column string, value any) *QueryBuilder {
-	op := "lte"
-	if q.negateNext {
-		op = "gt"
-		q.negateNext = false
-	}
-	q.addFilter(column, op, value)
-	return q
-}
-
-// Like filters where column matches the pattern (case-sensitive).
-// Use % as wildcard: Like("name", "%john%").
-func (q *QueryBuilder) Like(column, pattern string) *QueryBuilder {
-	op := "like"
-	if q.negateNext {
-		op = "nlike"
-		q.negateNext = false
-	}
-	q.addFilter(column, op, pattern)
-	return q
-}
-
-// ILike filters where column matches the pattern (case-insensitive).
-func (q *QueryBuilder) ILike(column, pattern string) *QueryBuilder {
-	op := "ilike"
-	if q.negateNext {
-		op = "nilike"
-		q.negateNext = false
-	}
-	q.addFilter(column, op, pattern)
-	return q
-}
-
-// Is filters where column is null or a boolean value.
-// Use Is("deleted_at", nil) to filter for NULL.
-func (q *QueryBuilder) Is(column string, value any) *QueryBuilder {
-	op := "is"
-	if q.negateNext {
-		op = "isnot"
-		q.negateNext = false
-	}
-	q.addFilter(column, op, value)
-	return q
-}
-
-// In filters where column is in the given values.
-//
-//	q.In("status", []any{"active", "pending"})
-func (q *QueryBuilder) In(column string, values []any) *QueryBuilder {
-	op := "in"
-	if q.negateNext {
-		op = "nin"
-		q.negateNext = false
-	}
-	q.addFilter(column, op, values)
-	return q
-}
-
-// Contains filters where array/jsonb column contains the given values.
-func (q *QueryBuilder) Contains(column string, value []any) *QueryBuilder {
-	q.addFilter(column, "cs", value)
-	q.negateNext = false
-	return q
-}
-
-// ContainedBy filters where array column is contained by values.
-func (q *QueryBuilder) ContainedBy(column string, value []any) *QueryBuilder {
-	q.addFilter(column, "cd", value)
-	q.negateNext = false
-	return q
-}
-
-// Overlaps filters where array column overlaps with values.
-func (q *QueryBuilder) Overlaps(column string, value []any) *QueryBuilder {
-	q.addFilter(column, "ov", value)
-	q.negateNext = false
-	return q
-}
-
-// TextSearch performs a full-text search on the column.
-func (q *QueryBuilder) TextSearch(column, query string) *QueryBuilder {
-	q.addFilter(column, "fts", query)
-	q.negateNext = false
-	return q
-}
-
-// Not negates the next filter method call.
-//
-//	q.Not().Eq("status", "deleted") // WHERE status != 'deleted'
-func (q *QueryBuilder) Not() *QueryBuilder {
-	q.negateNext = true
-	return q
-}
-
-// Or combines filters with OR logic. Pass a PostgREST-style filter string.
-//
-//	q.Or("status.eq.active,status.eq.pending")
-func (q *QueryBuilder) Or(filters string) *QueryBuilder {
-	q.filters = append(q.filters, map[string]any{"type": "or", "value": filters})
-	return q
-}
-
-// --- Ordering, limit, offset ---
-
-// Order sorts results by the given column. Pass ascending=true for ASC,
-// false for DESC.
-func (q *QueryBuilder) Order(column string, ascending bool) *QueryBuilder {
-	q.orderSpecs = append(q.orderSpecs, map[string]any{
-		"column":    column,
-		"ascending": ascending,
-	})
-	return q
-}
-
-// OrderNullsFirst sorts with explicit nulls-first/last control.
-func (q *QueryBuilder) OrderNullsFirst(column string, ascending bool, nullsFirst bool) *QueryBuilder {
-	q.orderSpecs = append(q.orderSpecs, map[string]any{
-		"column":     column,
-		"ascending":  ascending,
-		"nullsFirst": nullsFirst,
-	})
-	return q
-}
-
-// Limit sets the maximum number of rows to return.
-func (q *QueryBuilder) Limit(count int) *QueryBuilder {
-	q.limitCount = &count
-	return q
-}
-
-// Offset sets the number of rows to skip.
-func (q *QueryBuilder) Offset(count int) *QueryBuilder {
-	q.offsetCount = &count
-	return q
-}
-
-// Range sets the result range (inclusive on both ends).
-// Range(0, 9) returns the first 10 rows.
-func (q *QueryBuilder) Range(start, end int) *QueryBuilder {
-	q.offsetCount = &start
-	limit := end - start + 1
-	q.limitCount = &limit
-	return q
-}
-
-// Count includes a row count in the result. Valid options are "exact",
-// "planned", or "estimated".
-func (q *QueryBuilder) Count(countType string) *QueryBuilder {
-	q.countOption = countType
-	return q
-}
-
-// Execute runs the query and returns the result as a slice of maps.
-func (q *QueryBuilder) Execute(ctx context.Context) (*QueryResult[[]map[string]any], error) {
-	body := q.buildQuery()
-
-	raw, err := q.client.request(ctx, q.httpMethod(), "/db/"+url.PathEscape(q.table), body, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp := parseResponse[map[string]any](raw)
-	if resp.Error != nil {
-		return &QueryResult[[]map[string]any]{
-			Error:  &QueryError{Message: resp.Error.Message, Code: resp.Error.Code, Status: resp.Status, Operation: q.queryType + ":" + q.table, sentinel: resp.Error.sentinel},
-			Status: resp.Status,
-		}, nil
-	}
-
-	dataSlice, _ := resp.Data["data"].([]any)
-	rows := make([]map[string]any, 0, len(dataSlice))
-	for _, item := range dataSlice {
-		if m, ok := item.(map[string]any); ok {
-			rows = append(rows, m)
+func (q *Query) params(limit, offset int) (url.Values, error) {
+	v := url.Values{}
+	switch len(q.filters) {
+	case 0:
+	case 1:
+		raw, err := json.Marshal(q.filters[0])
+		if err != nil {
+			return nil, invalidArg("encoding filter: %v", err)
 		}
+		v.Set("where", string(raw))
+	default:
+		raw, err := json.Marshal(map[string]any{"AND": q.filters})
+		if err != nil {
+			return nil, invalidArg("encoding filter: %v", err)
+		}
+		v.Set("where", string(raw))
 	}
-
-	var count *int
-	if c, ok := resp.Data["count"].(float64); ok {
-		ci := int(c)
-		count = &ci
+	if len(q.columns) > 0 {
+		v.Set("select", strings.Join(q.columns, ","))
 	}
-
-	return &QueryResult[[]map[string]any]{
-		Data:   rows,
-		Status: resp.Status,
-		Count:  count,
-	}, nil
+	if len(q.order) > 0 {
+		cols := make([]string, len(q.order))
+		dirs := make([]string, len(q.order))
+		for i, o := range q.order {
+			cols[i] = o.column
+			dirs[i] = "asc"
+			if o.desc {
+				dirs[i] = "desc"
+			}
+		}
+		v.Set("orderBy", strings.Join(cols, ","))
+		v.Set("orderDir", strings.Join(dirs, ","))
+	}
+	if limit > 0 {
+		v.Set("limit", strconv.Itoa(limit))
+	}
+	if offset > 0 {
+		v.Set("offset", strconv.Itoa(offset))
+	}
+	return v, nil
 }
 
-// ExecuteInto runs the query and unmarshals the result into the provided
-// destination. The dest should be a pointer to a slice of structs:
-//
-//	var users []User
-//	err := client.DB.From("users").Select("*").ExecuteInto(ctx, &users)
-func (q *QueryBuilder) ExecuteInto(ctx context.Context, dest any) error {
-	body := q.buildQuery()
+func (q *Query) base() string {
+	return "/v1/data/" + url.PathEscape(q.client.projectID) + "/" + q.table
+}
 
-	raw, err := q.client.request(ctx, q.httpMethod(), "/db/"+url.PathEscape(q.table), body, nil)
+func (q *Query) rowPath(id string) (string, error) {
+	if id == "" {
+		return "", invalidArg("id must not be empty")
+	}
+	return q.base() + "/" + url.PathEscape(id), nil
+}
+
+type listBody struct {
+	Data  []Row `json:"data"`
+	Count *int  `json:"count"`
+}
+
+type rowBody struct {
+	Data Row `json:"data"`
+}
+
+func (q *Query) list(ctx context.Context, limit, offset int) (*listBody, error) {
+	if q.err != nil {
+		return nil, q.err
+	}
+	params, err := q.params(limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := q.client.send(ctx, request{method: http.MethodGet, path: q.base(), query: params}, false)
+	if err != nil {
+		return nil, err
+	}
+	var body listBody
+	if err := decodeJSON(resp, &body); err != nil {
+		return nil, err
+	}
+	if body.Data == nil {
+		body.Data = []Row{}
+	}
+	return &body, nil
+}
+
+// List fetches matching rows and the total match count.
+func (q *Query) List(ctx context.Context) (*ListResult, error) {
+	body, err := q.list(ctx, q.limit, q.offset)
+	if err != nil {
+		return nil, err
+	}
+	count := len(body.Data)
+	if body.Count != nil {
+		count = *body.Count
+	}
+	return &ListResult{Data: body.Data, Count: count}, nil
+}
+
+// ListInto decodes matching rows into dest (a pointer to a slice of structs)
+// and returns the total match count.
+func (q *Query) ListInto(ctx context.Context, dest any) (int, error) {
+	res, err := q.List(ctx)
+	if err != nil {
+		return 0, err
+	}
+	raw, err := json.Marshal(res.Data)
+	if err != nil {
+		return 0, err
+	}
+	if err := json.Unmarshal(raw, dest); err != nil {
+		return 0, fmt.Errorf("vaif: decoding rows: %w", err)
+	}
+	return res.Count, nil
+}
+
+// First returns the first matching row, or nil when there is none.
+func (q *Query) First(ctx context.Context) (Row, error) {
+	body, err := q.list(ctx, 1, q.offset)
+	if err != nil {
+		return nil, err
+	}
+	if len(body.Data) == 0 {
+		return nil, nil
+	}
+	return body.Data[0], nil
+}
+
+// Paginate fetches one page (page starts at 1).
+func (q *Query) Paginate(ctx context.Context, page, pageSize int) (*Page, error) {
+	if page < 1 {
+		return nil, invalidArg("page must be >= 1")
+	}
+	if pageSize < 1 || pageSize > MaxLimit {
+		return nil, invalidArg("pageSize must be between 1 and %d", MaxLimit)
+	}
+	body, err := q.list(ctx, pageSize, (page-1)*pageSize)
+	if err != nil {
+		return nil, err
+	}
+	total := len(body.Data)
+	if body.Count != nil {
+		total = *body.Count
+	}
+	return &Page{Data: body.Data, Total: total, Page: page, PageSize: pageSize}, nil
+}
+
+func (q *Query) rowCall(ctx context.Context, method, path string, query url.Values, payload any) (Row, error) {
+	resp, err := q.client.send(ctx, request{method: method, path: path, query: query, body: payload}, false)
+	if err != nil {
+		return nil, err
+	}
+	var body rowBody
+	if err := decodeJSON(resp, &body); err != nil {
+		return nil, err
+	}
+	if body.Data == nil {
+		return nil, &Error{Kind: ErrBadResponse, Status: resp.status, Message: "response did not include a row"}
+	}
+	return body.Data, nil
+}
+
+// Get fetches one row by primary key; errors.Is(err, ErrNotFound) if missing.
+func (q *Query) Get(ctx context.Context, id string) (Row, error) {
+	if q.err != nil {
+		return nil, q.err
+	}
+	path, err := q.rowPath(id)
+	if err != nil {
+		return nil, err
+	}
+	var query url.Values
+	if len(q.columns) > 0 {
+		query = url.Values{"select": {strings.Join(q.columns, ",")}}
+	}
+	return q.rowCall(ctx, http.MethodGet, path, query, nil)
+}
+
+// GetInto fetches one row and decodes it into dest.
+func (q *Query) GetInto(ctx context.Context, id string, dest any) error {
+	row, err := q.Get(ctx, id)
 	if err != nil {
 		return err
 	}
-
-	resp := parseResponse[map[string]any](raw)
-	if resp.Error != nil {
-		return &QueryError{Message: resp.Error.Message, Code: resp.Error.Code, Status: resp.Status, Operation: q.queryType + ":" + q.table, sentinel: resp.Error.sentinel}
-	}
-
-	dataSlice, _ := resp.Data["data"].([]any)
-	jsonBytes, err := json.Marshal(dataSlice)
-	if err != nil {
-		return fmt.Errorf("marshal query data: %w", err)
-	}
-
-	if err := json.Unmarshal(jsonBytes, dest); err != nil {
-		return fmt.Errorf("unmarshal into destination: %w", err)
-	}
-
-	return nil
+	return DecodeRow(row, dest)
 }
 
-// Single returns a single result, returning an error if no rows or multiple
-// rows are found.
-func (q *QueryBuilder) Single(ctx context.Context) (*QueryResult[map[string]any], error) {
-	one := 1
-	q.limitCount = &one
+// Insert inserts one row (a map or a struct) and returns it.
+func (q *Query) Insert(ctx context.Context, values any) (Row, error) {
+	if q.err != nil {
+		return nil, q.err
+	}
+	if values == nil {
+		return nil, invalidArg("values must not be nil")
+	}
+	return q.rowCall(ctx, http.MethodPost, q.base(), nil, values)
+}
 
-	result, err := q.Execute(ctx)
+// InsertMany inserts rows in one request; all rows must share the same keys.
+func (q *Query) InsertMany(ctx context.Context, rows []Row) ([]Row, error) {
+	if q.err != nil {
+		return nil, q.err
+	}
+	if len(rows) == 0 {
+		return []Row{}, nil
+	}
+	resp, err := q.client.send(ctx, request{method: http.MethodPost, path: q.base() + "/bulk", body: rows}, false)
 	if err != nil {
 		return nil, err
 	}
-
-	if result.Error != nil {
-		return &QueryResult[map[string]any]{Error: result.Error, Status: result.Status}, nil
-	}
-
-	if len(result.Data) == 0 {
-		return &QueryResult[map[string]any]{
-			Error:  &QueryError{Message: "No rows returned", Code: "PGRST116", Status: 406, Operation: q.queryType + ":" + q.table, sentinel: ErrNotFound},
-			Status: 406,
-		}, nil
-	}
-
-	return &QueryResult[map[string]any]{Data: result.Data[0], Status: result.Status}, nil
-}
-
-// MaybeSingle returns a single result or nil data if no rows found.
-// Unlike Single, it does not error on zero results.
-func (q *QueryBuilder) MaybeSingle(ctx context.Context) (*QueryResult[map[string]any], error) {
-	one := 1
-	q.limitCount = &one
-
-	result, err := q.Execute(ctx)
-	if err != nil {
+	var body listBody
+	if err := decodeJSON(resp, &body); err != nil {
 		return nil, err
 	}
-
-	if result.Error != nil {
-		return &QueryResult[map[string]any]{Error: result.Error, Status: result.Status}, nil
+	if body.Data == nil {
+		body.Data = []Row{}
 	}
-
-	if len(result.Data) == 0 {
-		return &QueryResult[map[string]any]{Status: result.Status}, nil
-	}
-
-	return &QueryResult[map[string]any]{Data: result.Data[0], Status: result.Status}, nil
+	return body.Data, nil
 }
 
-// ExecuteJSON is a convenience that returns the raw JSON bytes of the response.
-func (q *QueryBuilder) ExecuteJSON(ctx context.Context) (json.RawMessage, error) {
-	body := q.buildQuery()
-
-	raw, err := q.client.request(ctx, q.httpMethod(), "/db/"+url.PathEscape(q.table), body, nil)
-	if err != nil {
-		return nil, err
+// Upsert inserts values, or updates the row that conflicts on onConflict.
+func (q *Query) Upsert(ctx context.Context, values Row, onConflict ...string) (Row, error) {
+	if q.err != nil {
+		return nil, q.err
 	}
-
-	if raw.StatusCode >= 200 && raw.StatusCode < 300 {
-		return raw.Body, nil
+	if len(onConflict) == 0 {
+		return nil, invalidArg("Upsert needs at least one conflict column")
 	}
-
-	return nil, fmt.Errorf("query failed with status %d: %s", raw.StatusCode, string(raw.Body))
-}
-
-func (q *QueryBuilder) addFilter(column, operator string, value any) {
-	q.filters = append(q.filters, map[string]any{
-		"type":     "filter",
-		"column":   column,
-		"operator": operator,
-		"value":    value,
-	})
-}
-
-func (q *QueryBuilder) httpMethod() string {
-	switch q.queryType {
-	case "insert":
-		return "POST"
-	case "update":
-		return "PATCH"
-	case "delete":
-		return "DELETE"
-	default:
-		return "GET"
-	}
-}
-
-func (q *QueryBuilder) buildQuery() map[string]any {
-	query := map[string]any{"type": q.queryType}
-
-	if q.queryType == "select" {
-		query["select"] = q.selectCols
-	}
-
-	if q.queryType == "insert" && q.insertData != nil {
-		query["data"] = q.insertData
-		if len(q.onConflictColumns) > 0 {
-			conflict := map[string]any{
-				"columns": q.onConflictColumns,
-				"action":  q.onConflictAction,
-			}
-			if q.onConflictUpdate != nil {
-				conflict["update"] = q.onConflictUpdate
-			}
-			query["onConflict"] = conflict
+	for _, col := range onConflict {
+		if !isIdentifier(col) {
+			return nil, invalidArg("conflict column must be a SQL identifier, got %q", col)
 		}
 	}
-
-	if q.queryType == "update" && q.updateData != nil {
-		query["data"] = q.updateData
+	payload := make(Row, len(values)+2)
+	for k, v := range values {
+		payload[k] = v
 	}
+	payload["_upsert"] = true
+	payload["_conflict_columns"] = onConflict
+	return q.rowCall(ctx, http.MethodPost, q.base(), nil, payload)
+}
 
-	if len(q.filters) > 0 {
-		query["filters"] = q.filters
+// Update changes one row by primary key and returns it.
+func (q *Query) Update(ctx context.Context, id string, values any) (Row, error) {
+	if q.err != nil {
+		return nil, q.err
 	}
-
-	if len(q.orderSpecs) > 0 {
-		query["order"] = q.orderSpecs
+	path, err := q.rowPath(id)
+	if err != nil {
+		return nil, err
 	}
+	return q.rowCall(ctx, http.MethodPatch, path, nil, values)
+}
 
-	if q.limitCount != nil {
-		query["limit"] = *q.limitCount
+// Delete removes one row by primary key.
+func (q *Query) Delete(ctx context.Context, id string) error {
+	if q.err != nil {
+		return q.err
 	}
-
-	if q.offsetCount != nil {
-		query["offset"] = *q.offsetCount
+	path, err := q.rowPath(id)
+	if err != nil {
+		return err
 	}
+	_, err = q.client.send(ctx, request{method: http.MethodDelete, path: path}, false)
+	return err
+}
 
-	if q.countOption != "" {
-		query["count"] = q.countOption
+// Range selects the rows from index from to index to, both included and
+// counted from 0. The window holds at most MaxLimit rows.
+func (q *Query) Range(from, to int) *Query {
+	if from < 0 || to < from || to-from >= MaxLimit {
+		return q.fail(invalidArg("range must be ordered, non-negative and at most 1000 rows"))
 	}
+	return q.Offset(from).Limit(to - from + 1)
+}
 
-	if q.returning != "" {
-		query["returning"] = q.returning
+// Count returns the total matching rows, independently of the selected window.
+func (q *Query) Count(ctx context.Context) (int, error) {
+	body, err := q.list(ctx, 1, 0)
+	if err != nil {
+		return 0, err
 	}
-
-	return query
+	if body.Count == nil {
+		return 0, &Error{Kind: ErrBadResponse, Message: "response did not include count"}
+	}
+	return *body.Count, nil
 }

@@ -1,420 +1,618 @@
-// Package vaif provides the official Go SDK for VAIF Studio BaaS.
-//
-// Create a client with NewClient and access sub-services via the client:
-//
-//	client := vaif.NewClient("project-id", "api-key")
-//	result, err := client.DB.From("users").Select("*").Execute(ctx)
 package vaif
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
-// maxResponseBodySize limits the maximum response body size to 64 MB
-// to prevent denial-of-service from malicious servers sending unlimited data.
-const maxResponseBodySize = 64 << 20 // 64 MB
+// Version is the SDK version, sent in the User-Agent header.
+const Version = "1.0.0"
 
-// maxRetryAfterSeconds caps the Retry-After header to prevent a malicious
-// server from causing unbounded sleep.
-const maxRetryAfterSeconds = 300 // 5 minutes
+const (
+	// DefaultBaseURL is the production API origin.
+	DefaultBaseURL = "https://api.vaif.studio"
+	// DefaultTimeout bounds each HTTP attempt.
+	DefaultTimeout = 30 * time.Second
 
-// Client is the main VAIF Studio client. It holds configuration and provides
-// access to database, auth, storage, functions, realtime, and AI sub-clients.
-// Client is safe for concurrent use.
-type Client struct {
-	config      VaifConfig
-	accessToken string
-	tokenMu     sync.RWMutex // protects accessToken
-	httpClient  *http.Client
-	logger      Logger
+	apiKeyHeader = "x-vaif-key"
+	// maxResponseBytes caps how much of a response body is read into memory.
+	maxResponseBytes = 64 << 20
+)
 
-	// Sub-clients (initialized in NewClient)
-	DB        *Database
-	Auth      *Auth
-	Storage   *Storage
-	Functions *Functions
-	Realtime  *Realtime
-	AI        *AI
+// RetryPolicy controls retries of transient failures.
+//
+// Only replay-safe requests (GET, HEAD, OPTIONS, or calls marked idempotent)
+// are retried on RetryOn statuses and network errors. A request that failed
+// before a connection was established is retried for every method, since the
+// server never saw it.
+type RetryPolicy struct {
+	MaxRetries          int           // retries after the first attempt; 0 disables
+	BaseDelay           time.Duration // delay before the first retry
+	MaxDelay            time.Duration // cap on any single delay
+	Multiplier          float64       // exponential growth factor
+	RetryOn             []int         // statuses treated as transient
+	RetryOnNetworkError bool
 }
 
-// NewClient creates a new VAIF client with the given project ID and API key.
-// Use functional options to customize behavior:
-//
-//	client := vaif.NewClient("project-id", "api-key",
-//	    vaif.WithTimeout(10000),
-//	    vaif.WithRetry(3, 500*time.Millisecond),
-//	    vaif.WithDebug(true),
-//	)
-func NewClient(projectID, apiKey string, opts ...Option) *Client {
-	c := &Client{
-		config: VaifConfig{
-			ProjectID:        projectID,
-			APIKey:           apiKey,
-			APIURL:           "https://api.vaif.studio",
-			RealtimeURL:      "wss://realtime.vaif.studio",
-			Timeout:          30000,
-			Headers:          make(map[string]string),
-			AutoRefreshToken: true,
-			PersistSession:   true,
-			MaxRetries:       0,
-			RetryBackoff:     500 * time.Millisecond,
-			MaxRetryDelay:    30 * time.Second,
-		},
+// DefaultRetryPolicy retries up to 3 times on 429, 500, 502, 503 and 504
+// responses and on network errors, waiting 1s before the first retry and
+// doubling the wait up to 30s.
+func DefaultRetryPolicy() RetryPolicy {
+	return RetryPolicy{
+		MaxRetries:          3,
+		BaseDelay:           time.Second,
+		MaxDelay:            30 * time.Second,
+		Multiplier:          2,
+		RetryOn:             []int{429, 500, 502, 503, 504},
+		RetryOnNetworkError: true,
 	}
+}
 
-	// Apply options (they modify Client directly)
+// NoRetry disables retries.
+func NoRetry() RetryPolicy { return RetryPolicy{} }
+
+func (p RetryPolicy) retriesStatus(status int) bool {
+	for _, s := range p.RetryOn {
+		if s == status {
+			return true
+		}
+	}
+	return false
+}
+
+// delay returns the wait before retry number attempt (0-based), honoring a
+// server Retry-After hint and adding up to 25% jitter.
+func (p RetryPolicy) delay(attempt int, retryAfter time.Duration) time.Duration {
+	if retryAfter > 0 {
+		if p.MaxDelay > 0 && retryAfter > p.MaxDelay {
+			return p.MaxDelay
+		}
+		return retryAfter
+	}
+	mult := p.Multiplier
+	if mult <= 0 {
+		mult = 2
+	}
+	d := float64(p.BaseDelay)
+	for i := 0; i < attempt; i++ {
+		d *= mult
+	}
+	if p.MaxDelay > 0 && d > float64(p.MaxDelay) {
+		d = float64(p.MaxDelay)
+	}
+	return time.Duration(d + d*rand.Float64()*0.25)
+}
+
+// Option configures a Client.
+type Option func(*Client)
+
+// WithBaseURL sets the API origin. It must use https; plain http is accepted
+// only for localhost, 127.0.0.1 and ::1.
+func WithBaseURL(baseURL string) Option { return func(c *Client) { c.baseURL = baseURL } }
+
+// WithHTTPClient supplies the *http.Client used for every request.
+func WithHTTPClient(hc *http.Client) Option { return func(c *Client) { c.http = hc } }
+
+// WithTimeout bounds each HTTP attempt (default 30s). The caller's context
+// deadline still applies on top.
+func WithTimeout(d time.Duration) Option { return func(c *Client) { c.timeout = d } }
+
+// WithRetryPolicy replaces the retry policy.
+func WithRetryPolicy(p RetryPolicy) Option { return func(c *Client) { c.retry = p } }
+
+// WithHeader adds a header to every API request.
+func WithHeader(key, value string) Option {
+	return func(c *Client) { c.headers.Set(key, value) }
+}
+
+// WithSession restores a previously persisted end-user session. NewClient
+// keeps its own copy and applies SetSession's rules: AccessToken must not be
+// empty, and a zero ExpiresAt is treated as one hour from now.
+func WithSession(s *Session) Option { return func(c *Client) { c.initialSession = s } }
+
+// Client talks to one VAIF Studio project. It is safe for concurrent use.
+type Client struct {
+	projectID      string
+	apiKey         string
+	baseURL        string
+	http           *http.Client
+	timeout        time.Duration
+	retry          RetryPolicy
+	headers        http.Header
+	initialSession *Session
+	sleep          func(ctx context.Context, d time.Duration) error
+
+	// Auth signs end users in and keeps their session fresh.
+	Auth *AuthClient
+	// Storage uploads, downloads and signs URLs for objects.
+	Storage *StorageClient
+	// Functions invokes deployed functions.
+	Functions *FunctionsClient
+	// Operations is the generated OpenAPI layer.
+	Operations *OperationsClient
+	// Realtime subscribes to database changes.
+	Realtime *RealtimeClient
+}
+
+// NewClient creates a client for projectID, authenticating with a project API
+// key (sent as x-vaif-key). Use vk_pub_ keys in apps; vk_srv_ keys bypass
+// row-level security and belong on trusted servers only.
+func NewClient(projectID, apiKey string, opts ...Option) (*Client, error) {
+	c := &Client{
+		projectID: projectID,
+		apiKey:    apiKey,
+		baseURL:   DefaultBaseURL,
+		timeout:   DefaultTimeout,
+		retry:     DefaultRetryPolicy(),
+		headers:   http.Header{},
+		sleep:     sleepContext,
+	}
 	for _, opt := range opts {
 		opt(c)
 	}
+	if strings.TrimSpace(projectID) == "" {
+		return nil, invalidArg("projectID must not be empty")
+	}
+	if strings.TrimSpace(apiKey) == "" {
+		return nil, invalidArg("apiKey must not be empty")
+	}
+	if c.timeout <= 0 {
+		return nil, invalidArg("timeout must be positive")
+	}
+	if c.retry.MaxRetries < 0 {
+		return nil, invalidArg("MaxRetries must be >= 0")
+	}
+	base, err := normalizeBaseURL(c.baseURL)
+	if err != nil {
+		return nil, err
+	}
+	c.baseURL = base
+	if c.http == nil {
+		c.http = &http.Client{}
+	}
+	c.http = withRedirectPolicy(c.http)
+	var session *Session
+	if s := c.initialSession; s != nil {
+		if s.AccessToken == "" {
+			return nil, invalidArg("WithSession: AccessToken must not be empty")
+		}
+		copied := *s
+		if copied.ExpiresAt.IsZero() {
+			copied.ExpiresAt = time.Now().Add(time.Hour)
+		}
+		session = &copied
+	}
+	c.initialSession = nil
+	c.Auth = &AuthClient{client: c, session: session}
+	c.Storage = &StorageClient{client: c}
+	c.Functions = &FunctionsClient{client: c}
+	c.Operations = &OperationsClient{client: c}
+	c.Realtime = newRealtimeClient(c)
+	return c, nil
+}
 
-	// Set up HTTP client if not provided by WithHTTPClient
-	if c.httpClient == nil {
-		c.httpClient = &http.Client{
-			Timeout: time.Duration(c.config.Timeout) * time.Millisecond,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     90 * time.Second,
-			},
+// ProjectID returns the project this client targets.
+func (c *Client) ProjectID() string { return c.projectID }
+
+// BaseURL returns the normalized API origin.
+func (c *Client) BaseURL() string { return c.baseURL }
+
+// From starts an immutable query against table.
+func (c *Client) From(table string) *Query {
+	q := &Query{client: c, table: table}
+	if !isIdentifier(table) {
+		q.err = invalidArg("table must be a SQL identifier (letters, digits, _), got %q", table)
+	}
+	return q
+}
+
+func normalizeBaseURL(raw string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", invalidArg("base URL must be an absolute http(s) URL")
+	}
+	if u.Scheme == "http" && !allowsCleartext(u.Hostname()) {
+		return "", invalidArg("base URL must use https (http is accepted only for localhost, 127.0.0.1 and ::1)")
+	}
+	return strings.TrimRight(u.String(), "/"), nil
+}
+
+// allowsCleartext reports whether host (as url.URL.Hostname returns it) may be
+// reached without TLS: plain http, and plain ws for realtime, are for these
+// loopback hosts only. normalizeBaseURL and realtimeURL both ask it.
+func allowsCleartext(host string) bool {
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
+}
+
+// redirectKeeps are the headers a redirect to another origin keeps. Every
+// other header of the first request, including the project key, the bearer
+// token, cookies, WithHeader headers and headers passed for one call, is
+// removed.
+var redirectKeeps = map[string]bool{
+	"Accept": true, "Accept-Encoding": true, "Accept-Language": true,
+	"Content-Type": true, "Range": true, "User-Agent": true,
+}
+
+// withRedirectPolicy returns a copy of hc whose redirects never carry API
+// credentials to another origin and never move to plain http; the caller's
+// *http.Client is not changed. GET /storage/download answers with a 307 to a
+// presigned object-store URL, and net/http copies every header except
+// Authorization and Cookie to a redirect on another host, and follows a
+// redirect from https to http. So a redirect is refused unless it is https
+// (http only for the hosts allowsCleartext names), and once a redirect leaves
+// the origin of the first request, it keeps only the redirectKeeps headers.
+// The caller's own CheckRedirect then runs as usual.
+func withRedirectPolicy(hc *http.Client) *http.Client {
+	copied := *hc
+	next := hc.CheckRedirect
+	copied.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if req.URL.Scheme != "https" && (req.URL.Scheme != "http" || !allowsCleartext(req.URL.Hostname())) {
+			status := 0
+			if req.Response != nil {
+				status = req.Response.StatusCode
+			}
+			// The target is a presigned URL; its signature stays out of the error.
+			return &Error{Kind: ErrRequest, Status: status, Code: "INSECURE_REDIRECT", Message: "refused a redirect to a URL that is not https"}
+		}
+		if leftOrigin(req, via) {
+			for name := range req.Header {
+				if !redirectKeeps[http.CanonicalHeaderKey(name)] {
+					delete(req.Header, name)
+				}
+			}
+		}
+		if next != nil {
+			return next(req, via)
+		}
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		return nil
+	}
+	return &copied
+}
+
+// leftOrigin reports whether req, or any redirect before it, is on a scheme or
+// host other than the first request's. net/http copies the first request's
+// headers to every redirect, so a chain that comes back to the API origin is
+// still stripped.
+func leftOrigin(req *http.Request, via []*http.Request) bool {
+	first := via[0].URL
+	if req.URL.Scheme != first.Scheme || req.URL.Host != first.Host {
+		return true
+	}
+	for _, prev := range via[1:] {
+		if prev.URL.Scheme != first.Scheme || prev.URL.Host != first.Host {
+			return true
 		}
 	}
+	return false
+}
 
-	// Set default logger if debug enabled and no custom logger set
-	if c.config.Debug && c.logger == nil {
-		c.logger = log.Default()
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
 	}
-
-	// Initialize sub-clients
-	c.DB = &Database{client: c}
-	c.Auth = newAuth(c)
-	c.Storage = &Storage{client: c}
-	c.Functions = &Functions{client: c}
-	c.Realtime = newRealtime(c)
-	c.AI = &AI{client: c}
-
-	return c
-}
-
-// Option configures the client. Options are applied in order during NewClient.
-type Option func(*Client)
-
-// WithAPIURL sets a custom API URL.
-func WithAPIURL(apiURL string) Option {
-	return func(c *Client) { c.config.APIURL = apiURL }
-}
-
-// WithRealtimeURL sets a custom WebSocket URL.
-func WithRealtimeURL(wsURL string) Option {
-	return func(c *Client) { c.config.RealtimeURL = wsURL }
-}
-
-// WithTimeout sets the request timeout in milliseconds.
-func WithTimeout(ms int) Option {
-	return func(c *Client) { c.config.Timeout = ms }
-}
-
-// WithHeaders sets custom headers for all requests.
-func WithHeaders(headers map[string]string) Option {
-	return func(c *Client) { c.config.Headers = headers }
-}
-
-// WithDebug enables debug logging using the standard logger.
-func WithDebug(debug bool) Option {
-	return func(c *Client) { c.config.Debug = debug }
-}
-
-// WithRetry configures automatic retry with exponential backoff for transient
-// errors (network errors, HTTP 5xx, 429). The backoff parameter sets the
-// initial delay between retries; subsequent delays double with jitter.
-func WithRetry(maxRetries int, backoff time.Duration) Option {
-	return func(c *Client) {
-		c.config.MaxRetries = maxRetries
-		c.config.RetryBackoff = backoff
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
 	}
 }
 
-// WithMaxRetryDelay sets the maximum delay between retries. Defaults to 30s.
-func WithMaxRetryDelay(d time.Duration) Option {
-	return func(c *Client) { c.config.MaxRetryDelay = d }
+// request is one API call. body is JSON-encoded unless rawBody is set.
+type request struct {
+	method      string
+	path        string
+	query       url.Values
+	body        any
+	rawBody     []byte
+	contentType string
+	header      http.Header
+	bearer      string
+	idempotent  *bool
+	timeout     time.Duration
+	absoluteURL bool // path is a full URL (presigned storage); no API headers
 }
 
-// WithHTTPClient sets a custom http.Client for all requests. This overrides
-// the default client with its connection pooling and timeout settings.
-func WithHTTPClient(httpClient *http.Client) Option {
-	return func(c *Client) { c.httpClient = httpClient }
+type response struct {
+	status int
+	header http.Header
+	body   []byte
 }
 
-// WithLogger sets a custom logger. The Logger interface requires only Printf.
-func WithLogger(l Logger) Option {
-	return func(c *Client) { c.logger = l }
+func boolPtr(b bool) *bool { return &b }
+
+// isConnectFailure reports whether err happened before the request could have
+// reached the server (dial / DNS failure), which makes any method safe to retry.
+func isConnectFailure(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return true
+	}
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr)
 }
 
-// SetAccessToken sets the Bearer token for authenticated requests.
-func (c *Client) SetAccessToken(token string) {
-	c.tokenMu.Lock()
-	c.accessToken = token
-	c.tokenMu.Unlock()
+// do sends req with timeouts and bounded retries and returns a 2xx response.
+func (c *Client) do(ctx context.Context, req request) (*response, error) {
+	var payload []byte
+	contentType := req.contentType
+	if req.rawBody != nil {
+		payload = req.rawBody
+	} else if req.body != nil {
+		encoded, err := json.Marshal(req.body)
+		if err != nil {
+			return nil, invalidArg("encoding request body: %v", err)
+		}
+		payload = encoded
+		if contentType == "" {
+			contentType = "application/json"
+		}
+	}
+	target := req.path
+	if !req.absoluteURL {
+		target = c.baseURL + req.path
+	}
+	if len(req.query) > 0 {
+		target += "?" + req.query.Encode()
+	}
+	replaySafe := req.method == http.MethodGet || req.method == http.MethodHead || req.method == http.MethodOptions
+	if req.idempotent != nil {
+		replaySafe = *req.idempotent
+	}
+	timeout := c.timeout
+	if req.timeout > 0 {
+		timeout = req.timeout
+	}
+	policy := c.retry
+
+	for attempt := 0; ; attempt++ {
+		resp, err := c.attempt(ctx, req, target, payload, contentType, timeout)
+		canRetry := attempt < policy.MaxRetries
+		if err != nil {
+			if ctx.Err() != nil { // the caller canceled or its deadline passed
+				return nil, canceled(ctx.Err())
+			}
+			var sdkErr *Error
+			if errors.As(err, &sdkErr) { // e.g. an oversized body: final, not transient
+				return nil, sdkErr
+			}
+			retryable := policy.RetryOnNetworkError && (replaySafe || isConnectFailure(err))
+			if canRetry && retryable {
+				if serr := c.sleep(ctx, policy.delay(attempt, 0)); serr != nil {
+					return nil, canceled(serr)
+				}
+				continue
+			}
+			if req.absoluteURL {
+				return nil, objectStoreError(err, timeout)
+			}
+			return nil, transportError(err, target, timeout)
+		}
+		if resp.status >= 200 && resp.status < 300 {
+			return resp, nil
+		}
+		apiErr := errorFromResponse(resp.status, resp.header, resp.body, http.StatusText(resp.status))
+		if canRetry && replaySafe && policy.retriesStatus(resp.status) {
+			if serr := c.sleep(ctx, policy.delay(attempt, apiErr.RetryAfter)); serr != nil {
+				return nil, canceled(serr)
+			}
+			continue
+		}
+		return nil, apiErr
+	}
 }
 
-// GetAccessToken returns the current access token.
-func (c *Client) GetAccessToken() string {
-	c.tokenMu.RLock()
-	defer c.tokenMu.RUnlock()
-	return c.accessToken
+func networkError(err error, timeout time.Duration) *Error {
+	var netErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+		return &Error{Kind: ErrTimeout, Message: fmt.Sprintf("request timed out after %s", timeout), Err: err}
+	}
+	return &Error{Kind: ErrNetwork, Message: "could not reach the VAIF API", Err: err}
 }
 
-// GetConfig returns the current configuration.
-func (c *Client) GetConfig() VaifConfig {
-	return c.config
+// transportError wraps the transport failure of an API request sent to
+// target. GET /storage/download answers with a 307 to a presigned
+// object-store URL, and net/http reports a failure after that redirect with
+// the presigned URL. So a failure on a scheme or host other than target's is
+// reported by objectStoreError, which removes the signature.
+func transportError(err error, target string, timeout time.Duration) *Error {
+	if failedElsewhere(err, target) {
+		return objectStoreError(err, timeout)
+	}
+	return networkError(err, timeout)
 }
 
-// Close releases all resources held by the client, including any open
-// WebSocket connections.
-func (c *Client) Close() error {
-	if c.Realtime != nil {
-		return c.Realtime.Disconnect()
+// failedElsewhere reports whether err is net/http's *url.Error for a URL on a
+// scheme or host other than target's, which happens only after a redirect.
+// A URL that cannot be parsed counts as elsewhere, so it is removed.
+func failedElsewhere(err error, target string) bool {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return false
+	}
+	first, terr := url.Parse(target)
+	if terr != nil {
+		return false
+	}
+	failed, ferr := url.Parse(urlErr.URL)
+	if ferr != nil {
+		return true
+	}
+	// A refused redirect reports the Location header as sent, which may be
+	// relative to the request.
+	failed = first.ResolveReference(failed)
+	return failed.Scheme != first.Scheme || failed.Host != first.Host
+}
+
+// objectStoreError is networkError for a request to a signed object-store
+// URL. The URL's query carries its signature, so it is removed from the
+// *url.Error that net/http returns before the error is wrapped.
+func objectStoreError(err error, timeout time.Duration) *Error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		if u, perr := url.Parse(urlErr.URL); perr == nil {
+			u.RawQuery, u.ForceQuery, u.Fragment, u.RawFragment = "", false, "", ""
+			urlErr.URL = u.String()
+		} else {
+			urlErr.URL = ""
+		}
+	}
+	e := networkError(err, timeout)
+	if e.Kind == ErrNetwork {
+		e.Message = "could not reach the object store"
+	}
+	return e
+}
+
+func (c *Client) attempt(ctx context.Context, req request, target string, payload []byte, contentType string, timeout time.Duration) (*response, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var body io.Reader
+	if payload != nil {
+		body = bytes.NewReader(payload)
+	}
+	httpReq, err := http.NewRequestWithContext(attemptCtx, req.method, target, body)
+	if err != nil {
+		return nil, err
+	}
+	if req.absoluteURL {
+		// Presigned object-store URL: send no API credentials.
+		if contentType != "" {
+			httpReq.Header.Set("Content-Type", contentType)
+		}
+	} else {
+		for k, vs := range c.headers {
+			for _, v := range vs {
+				httpReq.Header.Add(k, v)
+			}
+		}
+		httpReq.Header.Set("Accept", "application/json")
+		httpReq.Header.Set("Accept-Versions", "v1")
+		httpReq.Header.Set("User-Agent", "vaif-go/"+Version)
+		for k, vs := range req.header {
+			httpReq.Header.Del(k)
+			for _, v := range vs {
+				httpReq.Header.Add(k, v)
+			}
+		}
+		if contentType != "" {
+			httpReq.Header.Set("Content-Type", contentType)
+		}
+		if c.apiKey != "" { // a platform client has no project key
+			httpReq.Header.Set(apiKeyHeader, c.apiKey)
+		}
+		if req.bearer != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+req.bearer)
+		}
+	}
+	httpResp, err := c.http.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer httpResp.Body.Close()
+	// Read one byte past the cap so an oversized body is an error, never a
+	// silently truncated download.
+	data, err := io.ReadAll(io.LimitReader(httpResp.Body, maxResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxResponseBytes {
+		return nil, &Error{
+			Kind:    ErrBadResponse,
+			Status:  httpResp.StatusCode,
+			Message: fmt.Sprintf("response body is larger than %d MiB; download large objects through Storage.CreateSignedURL", maxResponseBytes>>20),
+		}
+	}
+	return &response{status: httpResp.StatusCode, header: httpResp.Header, body: data}, nil
+}
+
+// functionRunHeader marks a response a deployed function produced. POST
+// /functions/:name/invoke relays the function's own status code and sets this
+// header on every response the function produced; the API sets it on no other
+// response.
+const functionRunHeader = "X-Vaif-Run-Id"
+
+// send issues an API request as the signed-in user, if any. A 401 from the
+// API on a request that carried a session token triggers one refresh and one
+// retry: the API refused the token before running the handler, so the replay
+// is safe. The retry carries the session the request carried, refreshed; when
+// the user signed out or another session was set while the request was in
+// flight, the 401 is returned instead. A 401 a function returned (it carries
+// functionRunHeader) is the function's answer and is returned as it is: the
+// function has already run.
+func (c *Client) send(ctx context.Context, req request, requireSession bool) (*response, error) {
+	bearer, generation, err := c.Auth.bearerFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if requireSession && bearer == "" {
+		return nil, &Error{Kind: ErrAuth, Code: "NOT_SIGNED_IN", Message: "not signed in"}
+	}
+	req.bearer = bearer
+	resp, err := c.do(ctx, req)
+	var apiErr *Error
+	if err == nil || bearer == "" || !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnauthorized ||
+		apiErr.header.Get(functionRunHeader) != "" {
+		return resp, err
+	}
+	fresh, ok, rerr := c.Auth.replayToken(ctx, bearer, generation)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if !ok {
+		return nil, err
+	}
+	req.bearer = fresh
+	return c.do(ctx, req)
+}
+
+func decodeJSON(resp *response, v any) error {
+	if len(resp.body) == 0 {
+		return &Error{Kind: ErrBadResponse, Status: resp.status, Message: "empty response body"}
+	}
+	if err := json.Unmarshal(resp.body, v); err != nil {
+		return &Error{Kind: ErrBadResponse, Status: resp.status, Message: "response was not valid JSON", Err: err}
 	}
 	return nil
 }
 
-// request makes an authenticated API request with optional retry logic.
-// It is the core HTTP method used by all sub-clients.
-func (c *Client) request(ctx context.Context, method, path string, body any, params url.Values) (*apiRawResponse, error) {
-	var lastErr error
-	maxAttempts := 1 + c.config.MaxRetries
-
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if attempt > 0 {
-			delay := c.retryDelay(attempt)
-			c.debug("retry attempt %d/%d after %v", attempt, c.config.MaxRetries, delay)
-
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(delay):
-			}
-		}
-
-		raw, err := c.doRequest(ctx, method, path, body, params)
-		if err != nil {
-			// Network-level errors are retryable
-			if c.isRetryable(0, err) && attempt < maxAttempts-1 {
-				lastErr = err
-				continue
-			}
-			return nil, err
-		}
-
-		// Check for retryable HTTP status codes
-		if c.isRetryable(raw.StatusCode, nil) && attempt < maxAttempts-1 {
-			lastErr = fmt.Errorf("HTTP %d", raw.StatusCode)
-
-			// Honor Retry-After header (capped to prevent malicious unbounded sleep)
-			if retryAfter := raw.Headers["retry-after"]; retryAfter != "" {
-				if secs, err := strconv.Atoi(retryAfter); err == nil {
-					if secs > maxRetryAfterSeconds {
-						secs = maxRetryAfterSeconds
-					}
-					if secs > 0 {
-						select {
-						case <-ctx.Done():
-							return nil, ctx.Err()
-						case <-time.After(time.Duration(secs) * time.Second):
-						}
-					}
-					// Skip the normal backoff delay on next iteration since we already waited
-					continue
-				}
-			}
-			continue
-		}
-
-		return raw, nil
+// canceled wraps the caller's context error; errors.Is(err, context.Canceled)
+// and errors.Is(err, context.DeadlineExceeded) keep working.
+func canceled(err error) *Error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &Error{Kind: ErrTimeout, Message: "context deadline exceeded", Err: err}
 	}
-
-	return nil, fmt.Errorf("request failed after %d attempts: %w", maxAttempts, lastErr)
+	return &Error{Kind: ErrNetwork, Message: "request canceled", Err: err}
 }
 
-// doRequest performs a single HTTP request without retry logic.
-func (c *Client) doRequest(ctx context.Context, method, path string, body any, params url.Values) (*apiRawResponse, error) {
-	// Build URL
-	u := c.config.APIURL + path
-	if len(params) > 0 {
-		u += "?" + params.Encode()
-	}
-
-	// Build body
-	var bodyReader io.Reader
-	if body != nil {
-		jsonBytes, err := json.Marshal(body)
-		if err != nil {
-			return nil, fmt.Errorf("marshal body: %w", err)
-		}
-		bodyReader = bytes.NewReader(jsonBytes)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, u, bodyReader)
+// NewPlatformClient creates a client for platform operations with an optional
+// WithSession token. Platform signup and password-reset requests return
+// CONSOLE_ONLY before HTTP. Use NewClient for application end users.
+func NewPlatformClient(opts ...Option) (*Client, error) {
+	c, err := NewClient("_platform", "_platform", opts...)
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, err
 	}
-
-	// Set headers
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Project-ID", c.config.ProjectID)
-	req.Header.Set("apikey", c.config.APIKey)
-
-	for k, v := range c.config.Headers {
-		req.Header.Set(k, v)
-	}
-
-	if token := c.GetAccessToken(); token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-
-	c.debug("%s %s", method, path)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("http request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Limit response body reads to prevent OOM from malicious servers
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize))
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	// Collect response headers
-	respHeaders := make(map[string]string)
-	for k := range resp.Header {
-		respHeaders[strings.ToLower(k)] = resp.Header.Get(k)
-	}
-
-	return &apiRawResponse{
-		StatusCode: resp.StatusCode,
-		Body:       respBody,
-		Headers:    respHeaders,
-	}, nil
-}
-
-// isRetryable returns true if the request should be retried.
-func (c *Client) isRetryable(statusCode int, err error) bool {
-	if c.config.MaxRetries <= 0 {
-		return false
-	}
-	if err != nil {
-		// Retry on network errors, but not on context cancellation
-		return !isContextError(err)
-	}
-	// Retry on 429 (rate limited) and 5xx (server errors)
-	return statusCode == 429 || statusCode >= 500
-}
-
-// retryDelay computes exponential backoff with jitter.
-func (c *Client) retryDelay(attempt int) time.Duration {
-	delay := c.config.RetryBackoff
-	for i := 1; i < attempt; i++ {
-		delay *= 2
-	}
-	// Add jitter: +/- 25%
-	jitter := time.Duration(rand.Int63n(int64(delay) / 2))
-	delay = delay - delay/4 + jitter
-
-	if delay > c.config.MaxRetryDelay {
-		delay = c.config.MaxRetryDelay
-	}
-	return delay
-}
-
-// isContextError checks if an error is from context cancellation/deadline.
-func isContextError(err error) bool {
-	return err == context.Canceled || err == context.DeadlineExceeded
-}
-
-// apiRawResponse holds the raw HTTP response data.
-type apiRawResponse struct {
-	StatusCode int
-	Body       []byte
-	Headers    map[string]string
-}
-
-// parseResponse parses the raw response into an ApiResponse with sentinel
-// error support.
-func parseResponse[T any](raw *apiRawResponse) *ApiResponse[T] {
-	result := &ApiResponse[T]{
-		Status:  raw.StatusCode,
-		Headers: raw.Headers,
-	}
-
-	if raw.StatusCode >= 200 && raw.StatusCode < 300 {
-		var data T
-		if err := json.Unmarshal(raw.Body, &data); err == nil {
-			result.Data = data
-		}
-	} else {
-		// Try to parse error from response body
-		var errBody map[string]any
-		if err := json.Unmarshal(raw.Body, &errBody); err == nil {
-			msg, _ := errBody["message"].(string)
-			if msg == "" {
-				if e, ok := errBody["error"].(string); ok {
-					msg = e
-				}
-			}
-			if msg == "" {
-				msg = fmt.Sprintf("Request failed with status %d", raw.StatusCode)
-			}
-			code, _ := errBody["code"].(string)
-			reqID, _ := raw.Headers["x-request-id"]
-			result.Error = &ApiError{
-				Message:   msg,
-				Code:      code,
-				Status:    raw.StatusCode,
-				RequestID: reqID,
-				sentinel:  sentinelForStatus(raw.StatusCode),
-			}
-		} else {
-			result.Error = &ApiError{
-				Message:  fmt.Sprintf("Request failed with status %d", raw.StatusCode),
-				Status:   raw.StatusCode,
-				sentinel: sentinelForStatus(raw.StatusCode),
-			}
-		}
-	}
-
-	return result
-}
-
-func (c *Client) debug(format string, args ...any) {
-	if c.logger != nil {
-		msg := fmt.Sprintf(format, args...)
-		// Mask credentials in debug output to prevent accidental exposure
-		msg = maskSecret(msg, c.config.APIKey)
-		if token := c.GetAccessToken(); token != "" {
-			msg = maskSecret(msg, token)
-		}
-		c.logger.Printf("[vaif] %s", msg)
-	}
-}
-
-// maskSecret replaces a secret value with a masked version in a string.
-func maskSecret(s, secret string) string {
-	if secret == "" || len(secret) < 8 {
-		return strings.ReplaceAll(s, secret, "***")
-	}
-	masked := secret[:4] + "***" + secret[len(secret)-4:]
-	return strings.ReplaceAll(s, secret, masked)
+	c.projectID = ""
+	c.apiKey = ""
+	return c, nil
 }
