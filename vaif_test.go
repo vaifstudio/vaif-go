@@ -133,18 +133,23 @@ func TestNewClientValidation(t *testing.T) {
 	if _, err := vaif.NewClient(testProject, ""); !errors.Is(err, vaif.ErrInvalidArg) {
 		t.Fatalf("empty key: %v", err)
 	}
-	_, err := vaif.NewClient(testProject, testKey, vaif.WithBaseURL("http://api.vaif.studio"))
-	var sdkErr *vaif.Error
-	if !errors.As(err, &sdkErr) || !errors.Is(err, vaif.ErrInvalidArg) {
-		t.Fatalf("plain http should be rejected: %v", err)
-	}
-	if sdkErr.Message != "base URL must use https (http is accepted only for localhost, 127.0.0.1 and ::1)" {
-		t.Fatalf("Message = %q; want the three loopback hosts named", sdkErr.Message)
+	// Plain http would send the project key and bearer token in cleartext.
+	for _, base := range []string{"http://api.vaif.studio", "http://api.example.com", "HTTP://api.example.com", "http://localhost.example.com"} {
+		_, err := vaif.NewClient(testProject, testKey, vaif.WithBaseURL(base))
+		var sdkErr *vaif.Error
+		if !errors.As(err, &sdkErr) || !errors.Is(err, vaif.ErrInvalidArg) {
+			t.Fatalf("WithBaseURL(%q) = %v; want ErrInvalidArg", base, err)
+		}
+		if sdkErr.Message != "base URL must use https (http is accepted only for localhost, 127.0.0.1 and ::1)" {
+			t.Fatalf("WithBaseURL(%q) Message = %q; want the three loopback hosts named", base, sdkErr.Message)
+		}
 	}
 	for base, want := range map[string]string{
-		"http://localhost:3000/": "http://localhost:3000",
-		"http://127.0.0.1:3000":  "http://127.0.0.1:3000",
-		"http://[::1]:3000":      "http://[::1]:3000",
+		"https://api.example.com/": "https://api.example.com",
+		"HTTPS://api.example.com":  "https://api.example.com",
+		"http://localhost:3000/":   "http://localhost:3000",
+		"http://127.0.0.1:3000":    "http://127.0.0.1:3000",
+		"http://[::1]:3000":        "http://[::1]:3000",
 	} {
 		c, err := vaif.NewClient(testProject, testKey, vaif.WithBaseURL(base))
 		if err != nil || c.BaseURL() != want {
