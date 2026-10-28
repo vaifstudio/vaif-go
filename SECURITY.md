@@ -2,9 +2,10 @@
 
 ## Reporting a vulnerability
 
-Report security vulnerabilities in this SDK privately by email to
-security@vaif.studio. Do not open a public GitHub issue or pull request for
-a vulnerability.
+Report security vulnerabilities in this SDK privately, through the "Report a
+vulnerability" form on this repository's Security tab (GitHub private
+vulnerability reporting) or by email to security@vaif.studio. Do not open a
+public GitHub issue or pull request for a vulnerability.
 
 The same address is published in the VAIF Studio
 [security.txt](https://vaif.studio/.well-known/security.txt) and on the
@@ -25,10 +26,11 @@ keep other people's data.
 
 ## What happens next
 
-1. We acknowledge your report by email.
-2. We investigate, confirm whether the SDK is affected, and keep you informed
+1. We acknowledge your report within 2 business days.
+2. We send an initial assessment within 5 business days.
+3. We investigate, confirm whether the SDK is affected, and keep you informed
    of our progress.
-3. When a fix is ready, we publish a release and record it in
+4. When a fix is ready, we publish a release and record it in
    [CHANGELOG.md](CHANGELOG.md). With your permission, we credit you in the
    release notes.
 
